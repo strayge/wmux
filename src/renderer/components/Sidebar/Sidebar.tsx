@@ -332,6 +332,10 @@ export default function Sidebar({
         onDragOver={handleListDragOver}
         onDrop={handleListDrop}
         onDragLeave={handleListDragLeave}
+        onDoubleClick={(e) => {
+          // Empty list space only — never a row, its controls, or a drag.
+          if (e.button === 0 && e.target === e.currentTarget && !draggedId) onCreate();
+        }}
       >
         {workspaces.map((ws) => (
           <WorkspaceRow

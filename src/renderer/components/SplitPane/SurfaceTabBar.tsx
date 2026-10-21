@@ -109,6 +109,7 @@ export default function SurfaceTabBar({
   const [openMenu, setOpenMenu] = useState<'new' | 'layout' | null>(null);
   const [menuPos, setMenuPos] = useState<{ top: number; right: number } | null>(null);
   const renameInputRef = useRef<HTMLInputElement>(null);
+  const tabsRef = useRef<HTMLDivElement>(null);
   const newCaretRef = useRef<HTMLButtonElement>(null);
   const layoutCaretRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -291,6 +292,12 @@ export default function SurfaceTabBar({
     <div
       className="surface-tab-bar"
       role="tablist"
+      onDoubleClick={(e) => {
+        if (e.button !== 0 || isDragActive || draggingSurfaceId) return;
+        // Only bare strip space creates a tab; tabs keep double-click rename
+        // and controls (including portalled menus) keep their own actions.
+        if (e.target === e.currentTarget || e.target === tabsRef.current) onNew();
+      }}
       onDragOver={(e) => {
         e.preventDefault();
         e.dataTransfer.dropEffect = 'move';
@@ -336,7 +343,7 @@ export default function SurfaceTabBar({
         }
       }}
     >
-      <div className="surface-tab-bar__tabs">
+      <div ref={tabsRef} className="surface-tab-bar__tabs">
         {surfaces.map((surface, index) => {
           const isActive = index === activeSurfaceIndex;
           const agentMeta = getAgentMeta(surface.id);
