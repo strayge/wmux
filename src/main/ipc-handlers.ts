@@ -5,7 +5,7 @@ import { IPC_CHANNELS, SurfaceId, WindowId, WorkspaceId, AgentId, type Insertion
 import { observePtyData, clearActivity } from './claude-observer';
 import { createPtyDataBatcher } from './pty-data-batcher';
 import { clearAgentState, noteHumanInput, listAgentStates } from './agent-state';
-import { PtyManager } from './pty-manager';
+import { PtyManager, type CreateOptions } from './pty-manager';
 import { PtyLedger, reapOrphans } from './pty-ledger';
 import { SshDetector } from './ssh-detect';
 import { agentIdentity } from './agent-identity';
@@ -584,7 +584,7 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
     }
   });
 
-  ipcMain.handle(IPC_CHANNELS.PTY_CREATE, async (_event, options) => {
+  ipcMain.handle(IPC_CHANNELS.PTY_CREATE, async (_event, options: CreateOptions) => {
     try {
       const resolvedOptions = {
         ...options,

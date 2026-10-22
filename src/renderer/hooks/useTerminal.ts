@@ -60,7 +60,7 @@ import {
   release as releaseAnchor,
   releaseAll as releaseAllAnchors,
 } from '../utils/prompt-anchor';
-import { withClaudeResume } from './claude-resume-command';
+import { withClaudeResume, piResumeCwdGuard } from './claude-resume-command';
 import '@xterm/xterm/css/xterm.css';
 
 declare global {
@@ -111,6 +111,8 @@ interface UseTerminalOptions {
   qwenSessionId?: string;
   /** Omp session to resume on a restored pane. */
   ompSessionId?: string;
+  piSessionId?: string;
+  piSessionCwd?: string;
 }
 
 interface UseTerminalResult {
@@ -811,7 +813,7 @@ export async function fetchTheme(name: string): Promise<ThemeConfig> {
   }
 }
 
-export function useTerminal({ surfaceId, shell, cwd, visible = true, focused = true, attachGeneration, colorScheme, startupCommands, env, claudeSessionId, codexSessionId, opencodeSessionId, agySessionId, qwenSessionId, ompSessionId }: UseTerminalOptions = {}): UseTerminalResult {
+export function useTerminal({ surfaceId, shell, cwd, visible = true, focused = true, attachGeneration, colorScheme, startupCommands, env, claudeSessionId, codexSessionId, opencodeSessionId, agySessionId, qwenSessionId, ompSessionId, piSessionId, piSessionCwd }: UseTerminalOptions = {}): UseTerminalResult {
   const t = useT();
   const terminalRef = useRef<HTMLDivElement | null>(null);
   const xtermRef = useRef<Terminal | null>(null);
@@ -856,6 +858,10 @@ export function useTerminal({ surfaceId, shell, cwd, visible = true, focused = t
   qwenSessionIdRef.current = qwenSessionId;
   const ompSessionIdRef = useRef<string | undefined>(ompSessionId);
   ompSessionIdRef.current = ompSessionId;
+  const piSessionIdRef = useRef<string | undefined>(piSessionId);
+  piSessionIdRef.current = piSessionId;
+  const piSessionCwdRef = useRef<string | undefined>(piSessionCwd);
+  piSessionCwdRef.current = piSessionCwd;
   // Read by the bell handler (#335), whose closure outlives every render.
   const visibleRef = useRef(visible);
   visibleRef.current = visible;
@@ -1783,8 +1789,10 @@ export function useTerminal({ surfaceId, shell, cwd, visible = true, focused = t
           attachToPty(surfaceId!);
         } else {
           // No existing PTY — create a new one, passing surfaceId so PTY ID = Surface ID
+          const baseCommands = startupCommandsRef.current;
+          const piEnabled = useStore.getState().workspacePrefs.restorePiSessions;
           const spawnCommands = withClaudeResume({
-            base: startupCommandsRef.current,
+            base: baseCommands,
             surfaceId,
             claudeSessionId: claudeSessionIdRef.current,
             enabled: useStore.getState().workspacePrefs.restoreClaudeSessions,
@@ -1798,9 +1806,18 @@ export function useTerminal({ surfaceId, shell, cwd, visible = true, focused = t
             qwenEnabled: useStore.getState().workspacePrefs.restoreQwenSessions,
             ompSessionId: ompSessionIdRef.current,
             ompEnabled: useStore.getState().workspacePrefs.restoreOmpSessions,
+            piSessionId: piSessionIdRef.current,
+            piSessionCwd: piSessionCwdRef.current,
+            piEnabled,
             shell: effectiveShell,
           });
-          window.wmux.pty.create({ shell: effectiveShell, cwd: effectiveCwd, env: envRef.current ?? {}, surfaceId, startupCommands: spawnCommands, cols: initialCols, rows: initialRows })
+          const piGuard = piResumeCwdGuard({
+            shellCwd: effectiveCwd, piSessionId: piSessionIdRef.current,
+            piSessionCwd: piSessionCwdRef.current, piEnabled,
+            base: baseCommands, commands: spawnCommands,
+          });
+          const spawnCwd = piGuard?.cwd ?? effectiveCwd;
+          window.wmux.pty.create({ shell: effectiveShell, cwd: spawnCwd, env: envRef.current ?? {}, surfaceId, startupCommands: spawnCommands, ...(piGuard ? { piResumeCwdGuard: piGuard } : {}), cols: initialCols, rows: initialRows })
             .then((created: { id: string; shell: string; reused: boolean; shellFallbackFrom?: string }) => {
               // PTY persists (keep-alive); a remount re-attaches via pty.has.
               if (disposed) return;

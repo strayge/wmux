@@ -231,7 +231,10 @@ const HANDLERS: Record<string, (surfaceId: SurfaceId, p: any) => any> = {
   },
 
   'pane.report_agent_session': (surfaceId, p) => ({
-    accepted: !!reportAgentSession(surfaceId, { seq: p.seq, sessionId: p.sessionId ?? null, provider: p.provider }),
+    accepted: !!reportAgentSession(surfaceId, {
+      seq: p.seq, sessionId: p.sessionId ?? null, provider: p.provider,
+      ...(p.provider === 'pi' ? { cwd: p.cwd } : {}),
+    }),
   }),
 
   // Distinct verbs keep the Codex launcher inert against older wmux instances.
@@ -265,6 +268,16 @@ const HANDLERS: Record<string, (surfaceId: SurfaceId, p: any) => any> = {
     const current = getAgentState(surfaceId);
     if (current?.sessionId && current.sessionProvider !== 'omp') return { released: false };
     if (p.sessionId && current?.sessionId && current.sessionId !== p.sessionId) return { released: false };
+    return { released: releaseAgent(surfaceId) };
+  },
+
+  // Only pi's current conversation may release its pane. An explicit empty
+  // session matches a status-only pi; an omitted session allows a scoped release.
+  'pane.release_pi_session': (surfaceId, p) => {
+    const current = getAgentState(surfaceId);
+    if (!current || (current.sessionProvider && current.sessionProvider !== 'pi')
+        || (current.sessionId && current.sessionProvider !== 'pi')) return { released: false };
+    if (p.sessionId != null && current.sessionId !== (p.sessionId || null)) return { released: false };
     return { released: releaseAgent(surfaceId) };
   },
 

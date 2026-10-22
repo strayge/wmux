@@ -111,6 +111,10 @@ export interface SurfaceRef {
    * `workspacePrefs.restoreOmpSessions` is on.
    */
   ompSessionId?: string;
+  /** Persisted pi conversation ID; restored only with restorePiSessions enabled. */
+  piSessionId?: string;
+  /** Pi's own cwd, paired with piSessionId (a worktree can differ from the shell). */
+  piSessionCwd?: string;
   /** Initial URL for a browser surface created from a quick-launch profile (issue #32). */
   url?: string;
   /** A browser surface's back/forward stack, restored on mount (#315). See shared/browser-history.ts. */

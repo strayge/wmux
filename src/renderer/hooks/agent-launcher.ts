@@ -15,45 +15,10 @@
 //
 // Pure: no Electron, no Node, exercised straight from vitest.
 
-export type ResumableAgent = 'claude' | 'codex' | 'opencode' | 'agy' | 'qwen' | 'omp';
+import { quoteOmpArg } from '../../shared/shell-quoting';
+export { quoteOmpArg, detectShellFamily, type ShellFamily } from '../../shared/shell-quoting';
 
-/** Which quoting rules a pane's shell applies to the resume it is typed. */
-export type ShellFamily = 'powershell' | 'posix' | 'cmd';
-
-export function detectShellFamily(shell?: string, samplePath?: string): ShellFamily {
-  if (!shell) {
-    return samplePath?.startsWith('/') ? 'posix' : 'powershell';
-  }
-  const lower = shell.toLowerCase();
-  if (/\b(pwsh|powershell)\b/.test(lower)) return 'powershell';
-  if (/\b(cmd|command)\b/.test(lower)) return 'cmd';
-  if (/\b(bash|zsh|sh|wsl|dash|ash)\b/.test(lower)) return 'posix';
-  return samplePath?.startsWith('/') ? 'posix' : 'powershell';
-}
-
-/**
- * Shell-aware quoting for omp session paths:
- * - PowerShell: single quotes with '' escaping (verbatim: no $ or ` expansion)
- * - POSIX (bash/zsh/sh/wsl): single quotes with '\'' escaping
- * - cmd.exe: double quotes (cmd expands %VAR%, does not support single quotes)
- */
-export function quoteOmpArg(id: string, shell?: string): string | null {
-  const family = detectShellFamily(shell, id);
-  if (family === 'powershell') {
-    // PowerShell also closes a single-quoted string on the typographic quotes
-    // U+2018-U+201B; doubling escapes each of them like a plain '.
-    return `'${id.replace(/['‘’‚‛]/g, '$&$&')}'`;
-  }
-  if (family === 'posix') {
-    return `'${id.replace(/'/g, "'\\''")}'`;
-  }
-  // cmd.exe expands %VAR% even inside quotes and has no escape for a double
-  // quote inside one, so a path carrying either is refused rather than typed.
-  if (id.includes('%') || id.includes('"')) {
-    return null;
-  }
-  return `"${id}"`;
-}
+export type ResumableAgent = 'claude' | 'codex' | 'opencode' | 'agy' | 'qwen' | 'omp' | 'pi';
 
 /**
  * The agents wmux can resume, how each takes a stored handle, and the
@@ -73,6 +38,7 @@ const RESUMABLE = {
   // Never called for omp: its handle is a path, which mergeResume quotes for
   // the pane's own shell (mergeOmpResume).
   omp: { executable: /^omp\d*$/, args: (id: string) => `--resume ${id}` },
+  pi: { executable: /^pi\d*$/, args: (id: string) => `--session ${id}` },
 } satisfies Record<ResumableAgent, { executable: RegExp; args: (id: string) => string }>;
 /** The command typed when nothing in the pane launches an agent. */
 const LAUNCH_COMMAND: Record<ResumableAgent, string> = {
@@ -82,6 +48,7 @@ const LAUNCH_COMMAND: Record<ResumableAgent, string> = {
   agy: 'agy --conversation',
   qwen: 'qwen --resume',
   omp: 'omp --resume',
+  pi: 'pi --session',
 };
 
 /** Wrappers a launcher can hide behind: `npx -y opencode`, `pnpm dlx codex`. */
@@ -159,7 +126,12 @@ export function launchedAgent(command: string): ResumableAgent | undefined {
       index++;
     }
     if (index + 1 >= tokens.length) return undefined;
-    name = executableName(tokens[index + 1]);
+    const packageToken = tokens[index + 1].replace(/^["']|["']$/g, '');
+    // These are npm package names, not executable basenames. Preserve the scope
+    // and optional version/tag when merging; @somebody/pi is not our pi.
+    if (/^@(earendil-works|mariozechner)\/pi-coding-agent(?:@[^/\s]+)?$/i.test(packageToken)) return 'pi';
+    name = executableName(packageToken);
+    if (packageToken.startsWith('@') && name && agentNamed(name) === 'pi') return undefined;
   }
   if (!name) return undefined;
   return agentNamed(name);
@@ -227,14 +199,16 @@ function isSeparateValueSessionFlag(raw: string): boolean {
   return raw === '--resume' || raw === '-r' || raw === '--session';
 }
 
-/** Every session-selecting flag in an omp command line, with its value. */
-function ompSessionFlagRanges(spans: CommandSpan[]): Range[] {
+/** Session-selecting flags shared by omp/pi, plus pi's explicit --session-id. */
+function ompSessionFlagRanges(spans: CommandSpan[], pi = false): Range[] {
   const ranges: Range[] = [];
   for (let i = 0; i < spans.length; i++) {
     const span = spans[i];
-    if (isSelfContainedSessionFlag(span.raw)) {
+    // pi's --resume/-r opens a picker; unlike omp it takes no path value.
+    if (isSelfContainedSessionFlag(span.raw)
+        || (pi && (span.raw.startsWith('--session-id=') || span.raw === '--resume' || span.raw === '-r'))) {
       ranges.push({ start: span.start, end: span.end });
-    } else if (isSeparateValueSessionFlag(span.raw)) {
+    } else if (isSeparateValueSessionFlag(span.raw) || (pi && span.raw === '--session-id')) {
       const next = spans[i + 1];
       const takesValue = next !== undefined && !next.raw.startsWith('-');
       ranges.push({ start: span.start, end: takesValue ? next.end : span.end });
@@ -292,6 +266,21 @@ function mergeOmpResume(command: string, id: string, shell?: string): string | n
   return `${result.trim()} --resume ${quoted}`;
 }
 
+function mergePiResume(command: string, id: string): string | null {
+  const spans = scanCommandSpans(command);
+  // An explicit ephemeral run/fork must keep its meaning. Do not append flags
+  // after --, where pi would read them as prompt text instead of options.
+  if (spans.some(({ raw }) => raw === '--no-session' || raw === '--fork'
+      || raw.startsWith('--fork=') || raw === '--')) return null;
+  let result = '';
+  let offset = 0;
+  for (const range of absorbSeparators(command, ompSessionFlagRanges(spans, true))) {
+    result += command.slice(offset, range.start);
+    offset = range.end;
+  }
+  return `${(result + command.slice(offset)).trim()} --session ${id}`;
+}
+
 /**
  * `base` with the resume added, or null when it must not be typed at all.
  *
@@ -315,6 +304,13 @@ export function mergeResume(
   }
   if (launcher.agent !== agent) return null;
   const next = [...commands];
+  if (agent === 'pi') {
+    const cleaned = mergePiResume(next[launcher.index], id);
+    if (!cleaned) return null;
+    // Pi's cwd guard is applied in main, after FINAL shell resolution.
+    next[launcher.index] = cleaned;
+    return next;
+  }
   if (agent === 'omp') {
     const cleaned = mergeOmpResume(next[launcher.index], id, shell);
     if (!cleaned) return null;

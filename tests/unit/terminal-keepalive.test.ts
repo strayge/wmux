@@ -154,7 +154,7 @@ describe('TerminalKeepAlive registry', () => {
 
 const mounts = { mounted: 0, unmounted: 0 };
 vi.mock('../../src/renderer/components/Terminal/TerminalPane', () => ({
-  default: function FakeTerminalPane(props: { surfaceId: string; visible?: boolean; attachGeneration?: number }) {
+  default: function FakeTerminalPane(props: { surfaceId: string; visible?: boolean; attachGeneration?: number; piSessionId?: string; piSessionCwd?: string }) {
     useEffect(() => {
       mounts.mounted += 1;
       return () => { mounts.unmounted += 1; };
@@ -163,6 +163,8 @@ vi.mock('../../src/renderer/components/Terminal/TerminalPane', () => ({
       className: 'fake-term',
       'data-visible': String(props.visible),
       'data-generation': String(props.attachGeneration),
+      'data-pi-session': props.piSessionId,
+      'data-pi-cwd': props.piSessionCwd,
     });
   },
 }));
@@ -195,8 +197,8 @@ describe('KeptAliveTerminal + TerminalHost', () => {
     const render = (pane: ReactElement | null) => act(() => {
       root!.render(createElement('div', null, pane, createElement(mod.TerminalHost)));
     });
-    const pane = (key: string, onActivate?: () => void) => createElement('section', { key, 'data-pane': key },
-      createElement(mod.default, { surfaceId: 'surf-x', visible: true, onActivate }));
+    const pane = (key: string, onActivate?: () => void, recovery?: { piSessionId: string; piSessionCwd: string }) => createElement('section', { key, 'data-pane': key },
+      createElement(mod.default, { surfaceId: 'surf-x', visible: true, onActivate, ...recovery }));
     return { setSurfaces, render, pane };
   }
 
@@ -214,6 +216,24 @@ describe('KeptAliveTerminal + TerminalHost', () => {
     expect(host!.querySelector('.fake-term')).toBe(term);
     expect(term.closest('[data-pane]')!.getAttribute('data-pane')).toBe('b');
     expect(Number(term.getAttribute('data-generation'))).toBeGreaterThan(1);
+  });
+
+  it('forwards the pi recovery pair through the portal without remounting on moves or parking', async () => {
+    const { setSurfaces, render, pane } = await setup();
+    setSurfaces(['surf-x']);
+    const recovery = { piSessionId: 'session-B', piSessionCwd: '/worktree/B' };
+    render(pane('a', undefined, recovery));
+    const term = host!.querySelector('.fake-term')!;
+    const generation = Number(term.getAttribute('data-generation'));
+    render(pane('b', undefined, recovery));
+    expect(host!.querySelector('.fake-term')).toBe(term);
+    expect(Number(term.getAttribute('data-generation'))).toBeGreaterThan(generation);
+    render(null);
+    expect(document.querySelector('.fake-term')).toBe(term);
+    expect(term.getAttribute('data-pi-session')).toBe(recovery.piSessionId);
+    expect(term.getAttribute('data-pi-cwd')).toBe(recovery.piSessionCwd);
+    expect(term.getAttribute('data-visible')).toBe('false');
+    expect(mounts).toEqual({ mounted: 1, unmounted: 0 });
   });
 
   it('keeps a hidden terminal alive while its surface exists (zoom), and disposes it once closed', async () => {

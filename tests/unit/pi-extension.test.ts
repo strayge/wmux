@@ -1,7 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as path from 'path';
-import { readFileSync } from 'node:fs';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
 import { pluginNeedsUpdate } from '../../src/main/agent-plugin-file';
+import { isValidPiSessionId } from '../../src/shared/pi-session';
 
 /**
  * Issue #231 — the SHIPPED extension, not a copy of its logic.
@@ -105,9 +107,10 @@ describe('#231 pi extension: activation', () => {
     expect(process.env.PI_IMAGE_PROTOCOL).toBe(protocol);
   });
 
-  it('updates previously installed extensions through the version marker', () => {
-    const source = readFileSync(EXTENSION, 'utf8');
-    expect(pluginNeedsUpdate(source, '// wmux-plugin-version: 1\nold source')).toBe(true);
+  it.each([1, 2, 3])('updates installed extension version %s through the version marker', (version) => {
+    const source = fs.readFileSync(EXTENSION, 'utf8');
+    expect(source).toMatch(/^\/\/ wmux-plugin-version: 4\r?\n/);
+    expect(pluginNeedsUpdate(source, `// wmux-plugin-version: ${version}\nold source`)).toBe(true);
   });
 
   it('runs the CLI through WMUX_NODE, never the host binary (#187)', async () => {
@@ -330,7 +333,7 @@ describe('#231 pi extension: shutdown', () => {
 
     await Promise.resolve();
     expect(settled).toBe(false);
-    expect(verbs()).toEqual([['release-agent', '--surface', SURFACE]]);
+    expect(verbs()).toEqual([['release-agent', '--provider', 'pi', '--session', '', '--surface', SURFACE]]);
 
     calls[0].cb(null, '', '');
     await pending;
@@ -345,6 +348,141 @@ describe('#231 pi extension: shutdown', () => {
     await vi.advanceTimersByTimeAsync(2500);
     await expect(pending).resolves.toBeUndefined();
   });
+});
+
+describe('pi extension: conversation lifetime', () => {
+  let tmp: string;
+  beforeEach(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-pi-extension-')); });
+  afterEach(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
+  const ctx = (id: string, file?: string) => ({ sessionManager: {
+    getSessionId: () => id, getSessionFile: () => file,
+  } });
+  const persisted = (id: string) => {
+    const file = path.join(tmp, `${id}.jsonl`);
+    fs.writeFileSync(file, JSON.stringify({ type: 'session', id }));
+    return ctx(id, file);
+  };
+  const sessions = () => verbs().filter(v => v[0] === 'report-session');
+
+  it('reports a persisted session with provider pi, deduping repeated lifecycle events', async () => {
+    const pi = await extensionWith({ PI_IMAGE_PROTOCOL: undefined });
+    const current = persisted('custom_session.1');
+    for (const event of ['session_start', 'agent_start', 'message_start', 'turn_end', 'agent_settled']) {
+      await pi.fire(event, {}, current);
+    }
+    expect(sessions()).toEqual([['report-session', 'custom_session.1', '--provider', 'pi', '--surface', SURFACE]]);
+    expect(process.env.PI_IMAGE_PROTOCOL).toBe('iterm2');
+    expect(calls.every(c => !c.opts.shell && !c.file.endsWith('.cmd'))).toBe(true);
+  });
+
+  it('does not capture unborn/ephemeral IDs but retries after the user message is persisted', async () => {
+    const pi = await extensionWith();
+    const file = path.join(tmp, 'unborn.jsonl');
+    const current = ctx('unborn', file);
+    await pi.fire('session_start', { reason: 'new' }, current);
+    await pi.fire('agent_start', {}, current);
+    expect(sessions().map(v => v[1])).toEqual(['']);
+    expect(verbs().some(v => v.includes('--run-depth'))).toBe(true);
+    // pi persists the user message after message_end. The assistant's following
+    // message_start can then report a durable conversation without a token timer.
+    fs.writeFileSync(file, '{}');
+    await pi.fire('message_start', { message: { role: 'assistant' } }, current);
+    await pi.fire('turn_end', {}, current);
+    expect(sessions().map(v => v[1])).toEqual(['', 'unborn']);
+    await pi.fire('session_start', { reason: 'new' }, ctx('ephemeral'));
+    expect(sessions().map(v => v[1])).toEqual(['', 'unborn', '']);
+  });
+
+  it('rebinds A -> B -> A rather than remembering every ID ever seen', async () => {
+    const pi = await extensionWith();
+    const a = persisted('session-A'); const b = persisted('session-B');
+    await pi.fire('session_start', {}, a);
+    await pi.fire('session_start', {}, b);
+    await pi.fire('session_start', {}, a);
+    expect(sessions().map(v => v[1])).toEqual(['session-A', 'session-B', 'session-A']);
+  });
+
+  it.each(['new', 'resume', 'fork', 'reload'])('does not release on %s shutdown and new runtime binds its current session', async reason => {
+    const old = await extensionWith();
+    const a = persisted('session-A');
+    await old.fire('session_start', {}, a);
+    await old.fire('session_shutdown', { reason }, a);
+    const next = await extensionWith();
+    await next.fire('session_start', { reason }, reason === 'reload' ? a : ctx('unborn'));
+    expect(verbs().some(v => v[0] === 'release-agent')).toBe(false);
+    expect(sessions().map(v => v[1])).toEqual(['session-A', reason === 'reload' ? 'session-A' : '']);
+  });
+
+  it('serializes slow reports before session switches and quit release', async () => {
+    holdCallbacks = true;
+    const pi = await extensionWith();
+    const a = persisted('session-A'); const b = persisted('session-B');
+    await pi.fire('message_start', {}, a);
+    await pi.fire('message_start', {}, b);
+    expect(sessions().map(v => v[1])).toEqual(['session-A']);
+    let settled = false;
+    const pending = pi.fire('session_shutdown', { reason: 'quit' }, b).then(() => { settled = true; });
+    calls[0].cb(null, '{"accepted":true}', '');
+    expect(sessions().map(v => v[1])).toEqual(['session-A', 'session-B']);
+    calls[1].cb(null, '{"accepted":true}', '');
+    expect(verbs()[2]).toEqual(['release-agent', '--provider', 'pi', '--session', 'session-B', '--surface', SURFACE]);
+    expect(settled).toBe(false);
+    calls[2].cb(null, '{"released":true}', '');
+    await pending;
+    expect(settled).toBe(true);
+  });
+
+  it.each([new Error('spawn failed'), null])('retries failed or rejected report rather than permanently deduping it', async error => {
+    holdCallbacks = true;
+    const pi = await extensionWith(); const a = persisted('session-A');
+    await pi.fire('message_start', {}, a);
+    calls[0].cb(error, '{"accepted":false}', '');
+    await pi.fire('message_start', {}, a);
+    expect(sessions().map(v => v[1])).toEqual(['session-A', 'session-A']);
+    calls[1].cb(null, '{"accepted":true}', '');
+  });
+
+  it('a timed-out shutdown ignores late callbacks and never sends queued stale reports', async () => {
+    holdCallbacks = true;
+    vi.useFakeTimers();
+    const pi = await extensionWith();
+    await pi.fire('session_start', {}, persisted('session-A'));
+    const pending = pi.fire('session_shutdown', { reason: 'reload' });
+    await vi.advanceTimersByTimeAsync(2100);
+    await pending;
+    const count = calls.length;
+    for (const call of calls) call.cb(null, '{"accepted":true}', '');
+    await pi.fire('message_start', {}, persisted('session-B'));
+    expect(calls.length).toBe(count);
+  });
+
+  it.each(['unsafe&calc', 'a.jsonl', 'A.JsOnL'])('refuses unsafe or path-interpreted custom ID %s', async id => {
+    const pi = await extensionWith();
+    await pi.fire('session_start', {}, persisted(id));
+    expect(sessions().map(v => v[1])).toEqual(['']);
+  });
+
+  it('uses the same ID boundary as main/renderer, including trailing shell newlines', async () => {
+    const file = path.join(tmp, 'session.jsonl');
+    fs.writeFileSync(file, '{}');
+    for (const id of ['a', 'A_b.C-1', 'a'.repeat(128), 'a'.repeat(129), '-a', 'a.',
+      'x.jsonl', 'X.JSONL', 'a\n', 'a\r', 'a\u2028', 'a\u2029', 'a&calc', 'a b', 'a/b', 'a%PATH%']) {
+      calls.length = 0;
+      const pi = await extensionWith();
+      await pi.fire('message_start', {}, ctx(id, file));
+      expect(sessions()[0][1], JSON.stringify(id)).toBe(isValidPiSessionId(id) ? id : '');
+    }
+  });
+
+  it('still releases the reported ID if its transcript is deleted before deliberate quit', async () => {
+    const pi = await extensionWith();
+    const current = persisted('session-A');
+    await pi.fire('message_start', {}, current);
+    fs.unlinkSync(current.sessionManager.getSessionFile()!);
+    await pi.fire('session_shutdown', { reason: 'quit' }, current);
+    expect(verbs().at(-1)).toEqual(['release-agent', '--provider', 'pi', '--session', 'session-A', '--surface', SURFACE]);
+  });
+
 });
 
 describe('#231 pi extension: the copied runtime resolver', () => {

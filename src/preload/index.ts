@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import * as os from 'os';
 import { IPC_CHANNELS, type InsertionResult, type NotificationSoundPickResult, type UpdateTriggerResult } from '../shared/types';
 import type { BrowserHistory } from '../shared/browser-history';
+import type { PiResumeCwdGuard } from '../shared/pi-resume-guard';
 import type {
   RemoteConsoleBridge,
   RemoteConsoleStatus,
@@ -32,7 +33,7 @@ const remoteConsole: RemoteConsoleBridge = {
 
 contextBridge.exposeInMainWorld('wmux', {
   pty: {
-    create: (options: { shell: string; cwd: string; env: Record<string, string>; surfaceId?: string; startupCommands?: string[]; cols?: number; rows?: number }) =>
+    create: (options: { shell: string; cwd: string; env: Record<string, string>; surfaceId?: string; startupCommands?: string[]; piResumeCwdGuard?: PiResumeCwdGuard; cols?: number; rows?: number }) =>
       ipcRenderer.invoke(IPC_CHANNELS.PTY_CREATE, options) as Promise<{ id: string; shell: string; startupCommandsConsumed?: boolean; reused: boolean; shellFallbackFrom?: string }>,
     write: (id: string, data: string) =>
       ipcRenderer.send(IPC_CHANNELS.PTY_WRITE, id, data),

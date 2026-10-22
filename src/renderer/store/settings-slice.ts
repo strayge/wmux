@@ -587,6 +587,8 @@ export interface WorkspacePrefs {
    * Off by default — every such pane starts an agent at once.
    */
   restoreOmpSessions: boolean;
+  /** Opt-in: reopen each tab's pi conversation with pi --session <id>. */
+  restorePiSessions: boolean;
   /**
    * How many terminal panes a new workspace opens with, and how they sit
    * (issue #212).
@@ -643,6 +645,7 @@ export const DEFAULT_WORKSPACE_PREFS: WorkspacePrefs = {
   restoreAgySessions: false,
   restoreQwenSessions: false,
   restoreOmpSessions: false,
+  restorePiSessions: false,
   detectAgentScreens: true,
   newWorkspacePanes: 3,
   newWorkspaceLayout: 'grid',

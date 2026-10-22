@@ -35,6 +35,7 @@ import { isValidOpencodeSessionId } from './opencode-resume';
 import { isValidAgyConversationId } from './agy-resume';
 import { isValidQwenSessionId } from './qwen-resume';
 import { isValidOmpSessionId } from './omp-resume';
+import { isValidPiSessionId, isValidPiSessionCwd } from '../shared/pi-session';
 import { resolveWireChoiceId } from '../shared/remote-console-protocol';
 
 export type AgentRunState = 'blocked' | 'working' | 'idle' | 'unknown';
@@ -104,6 +105,8 @@ export interface AgentStateRecord {
   /** Resumable session handle (a file/id), not a PID — survives a restart. */
   sessionId: string | null;
   sessionProvider?: AgentSessionProvider;
+  /** pi may switch worktrees without moving its parent shell's cwd. */
+  piSessionCwd?: string;
   /** Session capture alone says nothing about the agent's activity. */
   sessionOnly?: boolean;
   metadata: AgentMetadata;
@@ -445,7 +448,7 @@ export function reportAgent(surfaceId: SurfaceId, params: ReportAgentParams): Ag
 }
 
 /** Who a session handle belongs to — it decides the validator and the restore command. */
-export type AgentSessionProvider = 'claude' | 'codex' | 'opencode' | 'agy' | 'qwen' | 'omp';
+export type AgentSessionProvider = 'claude' | 'codex' | 'opencode' | 'agy' | 'qwen' | 'omp' | 'pi';
 const SESSION_VALIDATORS: Record<AgentSessionProvider, (id: unknown) => id is string> = {
   claude: isValidClaudeSessionId,
   codex: isValidCodexSessionId,
@@ -453,15 +456,16 @@ const SESSION_VALIDATORS: Record<AgentSessionProvider, (id: unknown) => id is st
   agy: isValidAgyConversationId,
   qwen: isValidQwenSessionId,
   omp: isValidOmpSessionId,
+  pi: isValidPiSessionId,
 };
 function isSessionProvider(value: unknown): value is AgentSessionProvider {
-  return value === 'claude' || value === 'codex' || value === 'opencode' || value === 'agy' || value === 'qwen' || value === 'omp';
+  return value === 'claude' || value === 'codex' || value === 'opencode' || value === 'agy' || value === 'qwen' || value === 'omp' || value === 'pi';
 }
 
 /** `pane.report_agent_session` — tie the pane to a resumable session handle. */
 export function reportAgentSession(
   surfaceId: SurfaceId,
-  params: { seq?: number; sessionId: string | null; provider?: unknown },
+  params: { seq?: number; sessionId: string | null; provider?: unknown; cwd?: unknown },
 ): AgentStateRecord | null {
   // Validated at the door, not at the point of use (issue #186). This value
   // arrives over the named pipe — a public interface — and since #186 it can
@@ -472,16 +476,28 @@ export function reportAgentSession(
   if (!isSessionProvider(requested)) return null;
   const provider: AgentSessionProvider = requested;
   const sessionId = SESSION_VALIDATORS[provider](params.sessionId) ? params.sessionId : null;
+  // Reject a malformed pair instead of binding its ID in an unrelated cwd.
+  // An older ID-only report remains valid and falls back to the shell cwd.
+  if (provider === 'pi' && sessionId && params.cwd !== undefined && !isValidPiSessionCwd(params.cwd)) return null;
+  const piSessionCwd = provider === 'pi' && sessionId && isValidPiSessionCwd(params.cwd) ? params.cwd : undefined;
   // Claude's handle comes with its hooks, which declare state too — and so does
   // Qwen's, through the same hooks. Codex's and OpenCode's arrive on their own,
   // and say nothing about whether it is working.
+  // A pi /new or ephemeral session explicitly clears its old handle. Never
+  // let that nullable report erase a different provider's declaration.
+  const current = records.get(surfaceId);
+  if (provider === 'pi' && sessionId === null && current
+      && ((current.sessionProvider && current.sessionProvider !== 'pi')
+        || (current.sessionId && current.sessionProvider !== 'pi'))) return null;
   const sessionOnly = provider !== 'claude' && provider !== 'qwen' && !records.has(surfaceId);
   const record = getOrCreate(surfaceId);
   if (!acceptSeq(record, params.seq)) return null;
   if (sessionOnly) record.sessionOnly = true;
-  const changed = record.sessionId !== sessionId || record.sessionProvider !== provider;
+  const changed = record.sessionId !== sessionId || record.sessionProvider !== provider || record.piSessionCwd !== piSessionCwd;
   record.sessionId = sessionId;
   record.sessionProvider = provider;
+  if (piSessionCwd !== undefined) record.piSessionCwd = piSessionCwd;
+  else delete record.piSessionCwd;
   releasedSessions.delete(surfaceId);
   missingSessions.delete(surfaceId);
   const result = commit(record);
@@ -860,6 +876,7 @@ export interface AgentStateSnapshot {
   answeredAt: number | null;
   sessionId: string | null;
   sessionProvider?: AgentSessionProvider;
+  piSessionCwd?: string;
   runDepth: number;
   metadata: AgentMetadata;
   updatedAt: number;
@@ -878,6 +895,7 @@ function snapshot(record: AgentStateRecord, now = Date.now()): AgentStateSnapsho
     answeredAt: record.answeredAt,
     sessionId: record.sessionId,
     sessionProvider: record.sessionProvider,
+    ...(record.piSessionCwd !== undefined ? { piSessionCwd: record.piSessionCwd } : {}),
     runDepth: record.runDepth,
     metadata: liveMetadata(record, now),
     updatedAt: record.updatedAt,

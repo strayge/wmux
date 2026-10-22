@@ -17,6 +17,7 @@ import { system32, opensshPath } from './system32';
 import { bashAlias, gitBashCandidates, isWslBashLauncher, isGitBashLauncher, GIT_BASH_LOGIN_ARGS } from './git-bash';
 import { deliverStartupCommandsWhenReady } from './startup-commands';
 import { browserEnvFor, WSL_ENV_PASSTHROUGH } from './pane-browser-env';
+import { guardPiStartupCommands, type PiResumeCwdGuard } from '../shared/pi-resume-guard';
 
 // Applied once, at load, before any PTY can exist — the exit callback it guards
 // is registered by node-pty inside pty.spawn(), so a later install would leave
@@ -586,6 +587,8 @@ export interface CreateOptions {
    *  `startupCommandsConsumed` is true whenever any were given and a caller
    *  must never type them a second time. */
   startupCommands?: string[];
+  /** Applied only after final shell resolution, before startup delivery. */
+  piResumeCwdGuard?: PiResumeCwdGuard;
 }
 
 /** What `create()` hands back. */
@@ -752,7 +755,8 @@ export class PtyManager {
     // the race: they run during init and the first prompt render — the only one
     // that triggers the leaky query — happens afterward, exactly as it does for a
     // plain terminal that shows no junk.
-    const startupCommands = (options.startupCommands ?? []).filter(
+    const suppliedStartupCommands = options.startupCommands ?? [];
+    const startupCommands = guardPiStartupCommands(suppliedStartupCommands, options.piResumeCwdGuard, shell).filter(
       (cmd): cmd is string => typeof cmd === 'string' && cmd.trim().length > 0,
     );
     //
@@ -767,7 +771,9 @@ export class PtyManager {
       // (so a stray CR is harmless) and runs it via Invoke-Expression.
       env.WMUX_STARTUP_COMMANDS = startupCommands.join('\n');
     }
-    const startupCommandsConsumed = startupCommands.length > 0;
+    // An omitted unsafe pi launch is still consumed: no caller may replay the
+    // unguarded original command because the final batch became empty.
+    const startupCommandsConsumed = suppliedStartupCommands.some(cmd => typeof cmd === 'string' && cmd.trim().length > 0);
 
     // CreateProcess fails with error 267 (ERROR_DIRECTORY) when the working dir
     // isn't a real directory, and node-pty surfaces that as an opaque "Cannot
@@ -855,7 +861,7 @@ export class PtyManager {
     this.ptys.set(id, entry);
     // After the entry is registered (onData/write look it up by id) and before
     // any output can arrive — node-pty delivers data asynchronously.
-    if (startupCommandsConsumed && !bakeIntoInit) this.typeStartupCommands(id, entry, startupCommands);
+    if (startupCommands.length > 0 && !bakeIntoInit) this.typeStartupCommands(id, entry, startupCommands);
     const fellBack = spec.command !== '' && requested === undefined;
     return { id, shell, startupCommandsConsumed, reused: false, ...(fellBack ? { shellFallbackFrom: spec.command } : {}) };
   }

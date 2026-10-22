@@ -6,6 +6,7 @@ import { stampAgySessionIds } from './agy-resume';
 import { stampQwenSessionIds } from './qwen-resume';
 import type { AgentSessionProvider } from './agent-state';
 import { stampOmpSessionIds } from './omp-resume';
+import { stampPiSessionIds } from './pi-resume';
 import type { SurfaceId } from '../shared/types';
 
 /**
@@ -18,7 +19,9 @@ function providerLookup(provider: AgentSessionProvider) {
     const agent = getAgentState(id);
     // An absent provider is Claude: that is what every report before #261 meant.
     if (agent?.sessionId && (agent.sessionProvider ?? 'claude') === provider) return agent.sessionId;
-    if (agent?.sessionId || wasAgentReleased(id)) return null;
+    // A nullable pi report means an explicit empty/ephemeral session, not
+    // awaiting-report silence. It must clear the conversation just left.
+    if (agent?.sessionId || agent?.sessionProvider === 'pi' || wasAgentReleased(id)) return null;
     return undefined;
   };
 }
@@ -44,5 +47,15 @@ export function stampAgentSessionIds<T>(tree: T): T {
   const opencode = stampOpencodeSessionIds(codex, providerLookup('opencode'));
   const agy = stampAgySessionIds(opencode, providerLookup('agy'));
   const qwen = stampQwenSessionIds(agy, providerLookup('qwen'));
-  return stampOmpSessionIds(qwen, providerLookup('omp'));
+  const omp = stampOmpSessionIds(qwen, providerLookup('omp'));
+  return stampPiSessionIds(omp, id => {
+    // Read the pair from ONE snapshot. A declared different provider owns the
+    // pane even if it currently has no persisted session of its own.
+    const agent = getAgentState(id);
+    if (agent?.sessionProvider === 'pi') {
+      return agent.sessionId ? { sessionId: agent.sessionId, cwd: agent.piSessionCwd } : null;
+    }
+    if (agent?.sessionId || agent?.sessionProvider || wasAgentReleased(id)) return null;
+    return undefined;
+  });
 }

@@ -4,7 +4,9 @@
 // a DOM and a PTY bridge. Everything here is pure except the module-level
 // guard, which is the one piece that genuinely has to be process-wide.
 
-import { mergeResume, type ResumableAgent } from './agent-launcher';
+import { mergeResume, lastAgentLauncher, type ResumableAgent } from './agent-launcher';
+import type { PiResumeCwdGuard } from '../../shared/pi-resume-guard';
+import { isValidPiSessionId, isValidPiSessionCwd } from '../../shared/pi-session';
 
 /** Mirrors CLAUDE_SESSION_ID_RE in src/main/claude-resume.ts. */
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
@@ -100,10 +102,21 @@ export function withClaudeResume(opts: {
   qwenEnabled?: boolean;
   ompSessionId?: string;
   ompEnabled?: boolean;
+  piSessionId?: string;
+  piSessionCwd?: string;
+  piEnabled?: boolean;
   shell?: string;
 }): string[] | undefined {
   const { base, surfaceId, claudeSessionId, enabled } = opts;
   if (!surfaceId) return base;
+  if (opts.piSessionId) {
+    if (!opts.piEnabled || claudeSessionId || opts.codexSessionId || opts.opencodeSessionId
+        || opts.agySessionId || opts.qwenSessionId || opts.ompSessionId) return base;
+    // Re-validate the user-editable session.json before typing into any shell.
+    if (!isValidPiSessionId(opts.piSessionId)
+        || (opts.piSessionCwd !== undefined && !isValidPiSessionCwd(opts.piSessionCwd))) return base;
+    return applyResume(base, surfaceId, 'pi', opts.piSessionId, opts.shell);
+  }
   if (opts.qwenSessionId) return withQwenResume(base, surfaceId, opts);
   if (opts.agySessionId) {
     // One provider per tab, as for Codex and OpenCode.
@@ -139,6 +152,27 @@ export function withClaudeResume(opts: {
   // user can edit, and it is about to become a command line.
   if (!SESSION_ID_RE.test(claudeSessionId)) return base;
   return applyResume(base, surfaceId, 'claude', claudeSessionId);
+}
+
+/** The renderer sends raw launch text + metadata, never a requested-shell guard. */
+export function piResumeCwdGuard(opts: {
+  shellCwd: string;
+  piSessionId?: string;
+  piSessionCwd?: string;
+  piEnabled?: boolean;
+  base: string[] | undefined;
+  commands: string[] | undefined;
+  reattaching?: boolean;
+}): PiResumeCwdGuard | undefined {
+  if (opts.reattaching || !opts.piEnabled || opts.commands === opts.base || opts.commands === undefined
+      || !isValidPiSessionId(opts.piSessionId) || !isValidPiSessionCwd(opts.piSessionCwd)) return undefined;
+  const launcher = lastAgentLauncher(opts.commands);
+  return launcher?.agent === 'pi' ? { index: launcher.index, cwd: opts.piSessionCwd } : undefined;
+}
+
+/** Set initial PTY cwd too; main guards launch after its final shell resolution. */
+export function restoredPiCwd(opts: Parameters<typeof piResumeCwdGuard>[0]): string {
+  return piResumeCwdGuard(opts)?.cwd ?? opts.shellCwd;
 }
 
 /**

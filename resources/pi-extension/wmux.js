@@ -1,4 +1,4 @@
-// wmux-plugin-version: 2
+// wmux-plugin-version: 4
 // wmux pi extension — bridges pi's lifecycle events to the wmux sidebar (#231).
 // Auto-installed by wmux to ~/.pi/agent/extensions/wmux.js.
 // No-ops entirely outside wmux (WMUX !== '1').
@@ -202,6 +202,32 @@ function metadataArgs(ctx) {
   return args;
 }
 
+// pi session ids are placed directly on a command line. Keep this deliberately
+// narrower than pi's own identifier grammar: no whitespace, quoting, slashes or
+// shell metacharacters can cross into the wmux CLI. *.jsonl is a PATH to pi,
+// even when there are no separators, so those custom IDs cannot be resumed.
+// Absolute end: $ alone also accepts a trailing newline (shell syntax).
+const SESSION_ID_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?(?![\s\S])/;
+
+/**
+ * Return the current persisted pi session id, or null for --no-session,
+ * not-yet-created sessions and unborn session files; undefined for missing APIs.
+ */
+function persistedSessionId(ctx) {
+  try {
+    const manager = ctx?.sessionManager;
+    if (!manager || typeof manager.getSessionId !== "function" ||
+        typeof manager.getSessionFile !== "function") return undefined;
+    const id = manager.getSessionId();
+    const file = manager.getSessionFile();
+    if (typeof id !== "string" || !SESSION_ID_RE.test(id) || /\.jsonl$/i.test(id) ||
+        typeof file !== "string" || !file || !existsSync(file)) return null;
+    return id;
+  } catch {
+    return null;
+  }
+}
+
 export default function wmuxExtension(pi) {
   const surface = process.env.WMUX_SURFACE_ID;
   // Outside wmux this file is inert. pi loads global extensions for every
@@ -215,67 +241,113 @@ export default function wmuxExtension(pi) {
 
   const runtime = resolveNodeRuntime();
 
-  /**
-   * Run a wmux CLI verb. Fire-and-forget by default; never throws into pi.
-   *
-   * `wait: true` returns a promise that resolves when the call finishes or the
-   * deadline passes, and is used only by session_shutdown — pi awaits that
-   * handler, and without the wait the process can exit before the spawn lands,
-   * leaving the pane declared "working" with nothing alive to correct it.
-   * Bounded, because a wedged wmux must not be able to hang pi's exit.
-   */
-  function wmux(args, { wait = false } = {}) {
-    const cli = process.env.WMUX_CLI;
-    const done = wait ? deferred() : null;
+  // One FIFO for this runtime: an async A report must never land after B, or
+  // after quit's release. Handlers enqueue without awaiting CLI processes on
+  // token/tool paths. Shutdown drains the FIFO before pi rebinds extensions.
+  const queue = [];
+  let active = null;
+  let stopped = false;
+  let closing = false;
+
+  function wmux(args, { onComplete } = {}) {
+    if (stopped) return;
+    queue.push({ args, onComplete });
+    pump();
+  }
+
+  function pump() {
+    if (active || stopped || !queue.length) return;
+    const item = queue.shift();
+    active = item;
+    const finish = (error, stdout) => {
+      if (active !== item) return;
+      clearTimeout(item.timer);
+      let ok = !error;
+      // The CLI can exit zero with a rejected report. Only an acknowledged
+      // report is deduped; failures retry at the next lifecycle boundary.
+      try { if (JSON.parse(stdout)?.accepted === false) ok = false; } catch {}
+      item.onComplete?.(ok);
+      active = null;
+      pump();
+    };
+    item.timer = setTimeout(() => {
+      item.child?.kill();
+      finish(new Error("wmux report timed out"));
+    }, SHUTDOWN_DEADLINE_MS);
+    item.timer.unref?.();
     try {
-      // WMUX_CLI is always set alongside WMUX=1 by any wmux that installed this
-      // file. Without it the only PATH entry on Windows is `wmux.cmd`, which
-      // execFile cannot spawn without a shell — and a shell is exactly what
-      // #154 keeps out of this path.
-      if (!cli) {
-        if (process.platform === "win32") return settle(done);
-        return spawn("wmux", args, {}, done);
-      }
+      const cli = process.env.WMUX_CLI;
+      // Never execute a .cmd through a shell: argv contains agent data.
+      if (!cli && process.platform === "win32") return finish(new Error("no CLI"));
       const opts = { windowsHide: true };
-      // wmux's own Electron binary is Node only with this set; without it the
-      // same exe opens a second wmux window.
       if (runtime.electron) opts.env = { ...process.env, ELECTRON_RUN_AS_NODE: "1" };
-      return spawn(runtime.file, [cli, ...args], opts, done);
-    } catch {
-      return settle(done);
+      item.child = execFile(cli ? runtime.file : "wmux", cli ? [cli, ...item.args] : item.args, opts, finish);
+    } catch (error) {
+      finish(error);
     }
   }
 
-  function spawn(file, argv, opts, done) {
-    let timer = null;
-    if (done) {
-      timer = setTimeout(() => settle(done), SHUTDOWN_DEADLINE_MS);
-      // Never keep pi's event loop alive for a report nobody is waiting on.
-      timer.unref?.();
-    }
-    execFile(file, argv, opts, () => {
-      if (timer) clearTimeout(timer);
-      settle(done);
+  async function drain() {
+    // One total budget, not one deadline per queued process. On timeout discard
+    // pending reports and kill the active client before the replacement runtime
+    // starts, so old callbacks cannot re-register a conversation after release.
+    await new Promise(resolve => {
+      const deadline = setTimeout(() => {
+        stopped = true;
+        queue.length = 0;
+        const old = active;
+        active = null;
+        if (old) { clearTimeout(old.timer); old.child?.kill(); }
+        resolve();
+      }, SHUTDOWN_DEADLINE_MS);
+      const check = () => {
+        if (!active && !queue.length) {
+          clearTimeout(deadline);
+          resolve();
+        } else {
+          const last = queue.length ? queue[queue.length - 1] : active;
+          const previous = last.onComplete;
+          last.onComplete = ok => { previous?.(ok); queueMicrotask(check); };
+        }
+      };
+      check();
     });
-    return done ? done.promise : undefined;
-  }
-
-  function deferred() {
-    let resolve;
-    const promise = new Promise((r) => { resolve = r; });
-    return { promise, resolve, settled: false };
-  }
-
-  function settle(done) {
-    if (!done) return undefined;
-    if (!done.settled) {
-      done.settled = true;
-      done.resolve();
-    }
-    return done.promise;
+    stopped = true;
   }
 
   const report = (...args) => wmux(["report-agent", "--surface", surface, ...args]);
+
+  // Dedupe the latest transition, not every ID ever seen: A -> B -> A must
+  // rebind A. Null explicitly clears A when /new selects an unborn session or
+  // --no-session; undefined (older/missing API) is genuine silence.
+  let latestSession;
+  let sessionRevision = 0;
+  const reportSession = (ctx) => {
+    const id = persistedSessionId(ctx);
+    // Snapshot primitive values now, never retain a mutable context in the FIFO.
+    const cwd = id && typeof ctx?.cwd === "string" ? ctx.cwd : undefined;
+    if (stopped || id === undefined || (id === latestSession?.id && cwd === latestSession?.cwd)) return;
+    latestSession = { id, cwd };
+    const revision = ++sessionRevision;
+    const args = ["report-session", id ?? "", "--provider", "pi", "--surface", surface];
+    if (cwd !== undefined) args.push("--cwd", cwd);
+    wmux(args, {
+      onComplete: ok => {
+        if (!ok && revision === sessionRevision) latestSession = undefined;
+      },
+    });
+  };
+
+  // In-process subagents inherit the surface env but do not own this pane.
+  // Ignore ALL their events, especially shutdown (which must not drain/stop the
+  // parent's queue). This integration-specific symbol is not a public Pi API;
+  // unmarked child sessions cannot be distinguished here.
+  const childUIMarker = Symbol.for("pi-subagents:child-extension-ui");
+  const on = (name, handler) => pi.on(name, (event, ctx) => {
+    if (closing || stopped || ctx?.ui?.[childUIMarker]) return;
+    if (name !== "session_shutdown") reportSession(ctx);
+    return handler(event, ctx);
+  });
 
   let lastActivityPing = 0;
 
@@ -304,7 +376,7 @@ export default function wmuxExtension(pi) {
 
   // ── Run state ──────────────────────────────────────────────────────────────
 
-  pi.on("agent_start", async (_event, ctx) => {
+  on("agent_start", async (_event, ctx) => {
     clearBlocked();
     report("--run-depth", "1");
     sendMetadata(ctx);
@@ -313,24 +385,24 @@ export default function wmuxExtension(pi) {
   // agent_end is deliberately NOT handled: pi may still retry, compact or drain
   // queued follow-ups after it, and calling the pane idle there makes the
   // sidebar flicker through "idle" in the middle of work that is still running.
-  pi.on("agent_settled", async (_event, ctx) => {
+  on("agent_settled", async (_event, ctx) => {
     report("--run-depth", "0");
     sendMetadata(ctx);
   });
 
   // ── Parked on a human ──────────────────────────────────────────────────────
 
-  pi.on("ui_prompt_start", async (event) => {
+  on("ui_prompt_start", async (event) => {
     report("--blocked", promptReason(event));
   });
 
-  pi.on("ui_prompt_end", async () => {
+  on("ui_prompt_end", async () => {
     clearBlocked();
   });
 
   // ── Activity, so the sidebar can say what it is doing ──────────────────────
 
-  pi.on("tool_execution_start", async (event) => {
+  on("tool_execution_start", async (event) => {
     const now = Date.now();
     if (now - lastActivityPing < ACTIVITY_THROTTLE_MS) return;
     lastActivityPing = now;
@@ -340,7 +412,7 @@ export default function wmuxExtension(pi) {
     wmux(args);
   });
 
-  pi.on("tool_execution_end", async (event) => {
+  on("tool_execution_end", async (event) => {
     const tool = typeof event?.toolName === "string" ? event.toolName : "";
     if (!tool || READ_ONLY_TOOLS.has(tool)) return;
     // Feeds the explorer's diff rollup the same way Claude Code's PostToolUse
@@ -348,17 +420,17 @@ export default function wmuxExtension(pi) {
     wmux(["hook", "--event", "PostToolUse", "--tool", tool]);
   });
 
-  pi.on("turn_end", async (_event, ctx) => {
+  on("turn_end", async (_event, ctx) => {
     sendMetadata(ctx);
   });
 
-  pi.on("model_select", async (_event, ctx) => {
+  on("model_select", async (_event, ctx) => {
     sendMetadata(ctx);
   });
 
   // ── Session boundaries ─────────────────────────────────────────────────────
 
-  pi.on("session_start", async (_event, ctx) => {
+  on("session_start", async (_event, ctx) => {
     // A restored or switched session starts idle: state it, rather than letting
     // whatever the previous session declared stand.
     clearBlocked();
@@ -366,11 +438,33 @@ export default function wmuxExtension(pi) {
     sendMetadata(ctx);
   });
 
-  pi.on("session_shutdown", async () => {
-    // release-agent, not `--run-depth 0`: the pane stops having a declared
-    // agent at all, so the sidebar falls back to the shell's own state rather
-    // than showing a pi that is gone as "idle" forever.
-    await wmux(["release-agent", "--surface", surface], { wait: true });
+  // The user message is durable by the assistant's following message_start;
+  // the wrapper retries capture here without awaiting CLI work on the stream.
+  on("message_start", async () => {});
+
+  on("session_shutdown", async (event, ctx) => {
+    closing = true;
+    // Telemetry is expendable at shutdown; the latest binding and quit release
+    // are not. Keep the active request ordered before them, but never let 25
+    // healthy hook processes consume the entire two-second drain budget.
+    const latestPendingSession = queue.filter(item => item.args[0] === "report-session").at(-1);
+    queue.length = 0;
+    if (latestPendingSession) queue.push(latestPendingSession);
+    // Reload/new/resume/fork tear down an old extension instance while its pane
+    // remains alive. Only quit may release the declaration; an absent reason is
+    // retained for older pi versions that did not provide one.
+    if (event?.reason === undefined || event.reason === "quit") {
+      // Enqueued AFTER the active/latest binding. Include an empty session for an
+      // unborn/ephemeral pi, so its late quit cannot release a newer handle.
+      // Release THIS context's ID, not a newer binding. If its transcript was
+      // deleted while pi was open, it still owns the matching reported handle.
+      let id = persistedSessionId(ctx);
+      try {
+        if (id === null && ctx?.sessionManager?.getSessionId() === latestSession?.id) id = latestSession.id;
+      } catch {}
+      wmux(["release-agent", "--provider", "pi", "--session", id ?? "", "--surface", surface]);
+    }
+    await drain();
   });
 }
 
