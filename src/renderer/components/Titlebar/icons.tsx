@@ -20,6 +20,16 @@ const base = {
   strokeLinejoin: 'round' as const,
 };
 
+/** Sidebar — a window with a narrow navigation panel on the left. */
+export function IconSidebar({ className, size = 16 }: IconProps) {
+  return (
+    <svg className={className} width={size} height={size} viewBox="0 0 24 24" strokeWidth={2} {...base} aria-hidden="true">
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="M9 4v16" />
+    </svg>
+  );
+}
+
 /** Help — question mark in a circle. */
 export function IconHelp({ className, size = 16 }: IconProps) {
   return (

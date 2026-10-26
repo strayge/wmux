@@ -9,7 +9,7 @@ import React from 'react';
 import logoSrc from '../../../../resources/icons/icon.svg';
 import NotificationBell from './NotificationBell';
 import UpdateBadge from './UpdateBadge';
-import { IconHelp, IconCode, IconSettings, IconPixelAgent, IconFocus, IconFolder } from './icons';
+import { IconHelp, IconCode, IconSettings, IconPixelAgent, IconFocus, IconFolder, IconSidebar } from './icons';
 import WindowControls, { useIsFramelessWindow } from './WindowControls';
 import { NotificationInfo, WorkspaceId, PaneId, SurfaceId } from '../../../shared/types';
 import { useT } from '../../i18n';
@@ -19,6 +19,8 @@ import '../../styles/titlebar.css';
 
 interface TitlebarProps {
   title?: string;
+  sidebarVisible: boolean;
+  onToggleSidebar: () => void;
   onHelpClick?: () => void;
   onDevToolsClick?: () => void;
   onSettingsClick?: () => void;
@@ -42,6 +44,8 @@ interface TitlebarProps {
 
 export default function Titlebar({
   title,
+  sidebarVisible,
+  onToggleSidebar,
   onHelpClick,
   onDevToolsClick,
   onSettingsClick,
@@ -59,6 +63,9 @@ export default function Titlebar({
   onToggleExplorer,
 }: TitlebarProps) {
   const t = useT();
+  const sidebarLabel = sidebarVisible
+    ? t('sidebar.collapse', 'Collapse sidebar (Ctrl+B)')
+    : t('app.expandSidebar', 'Expand sidebar (Ctrl+B)');
   // The tooltip names the CONFIGURED key, not the default: a rebound shortcut
   // advertised as Ctrl+Shift+X would teach the user a key that does nothing.
   const explorerBinding = formatBinding(useStore((s) => s.shortcuts.toggleExplorer));
@@ -78,6 +85,15 @@ export default function Titlebar({
           onClick={() => window.wmux?.system?.openExternal?.('https://wmux.org') }
           title="wmux.org"
         />
+        <button
+          className="titlebar__btn"
+          onClick={onToggleSidebar}
+          title={sidebarLabel}
+          aria-label={sidebarLabel}
+          aria-pressed={sidebarVisible}
+        >
+          <IconSidebar />
+        </button>
         <button className="titlebar__btn" onClick={onHelpClick} title={t('titlebar.help')}>
           <IconHelp />
         </button>

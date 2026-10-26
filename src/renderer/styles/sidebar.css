@@ -14,31 +14,6 @@
   flex-shrink: 0;
 }
 
-.sidebar__header {
-  height: 38px;
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  padding: 0 6px;
-}
-.sidebar__collapse-btn {
-  background: transparent;
-  border: none;
-  color: rgba(var(--ui-overlay-rgb), 0.3);
-  cursor: pointer;
-  padding: 4px;
-  border-radius: 4px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: color 0.1s, background 0.1s;
-}
-.sidebar__collapse-btn:hover {
-  color: rgba(var(--ui-overlay-rgb), 0.8);
-  background: rgba(var(--ui-overlay-rgb), 0.08);
-}
-
 .sidebar__list {
   flex: 1;
   overflow-y: auto;

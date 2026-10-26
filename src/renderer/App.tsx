@@ -1665,6 +1665,8 @@ export default function App() {
       {settingsOpen && <SettingsWindow initialTab={settingsTab} onClose={() => setSettingsOpen(false)} />}
       <Titlebar
         title={titlebarText}
+        sidebarVisible={sidebarVisible}
+        onToggleSidebar={toggleSidebar}
         onHelpClick={() => setTutorialOpen(true)}
         onDevToolsClick={() => window.wmux?.system?.toggleDevTools?.()}
         onSettingsClick={() => openSettings()}
