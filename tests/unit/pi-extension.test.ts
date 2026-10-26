@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as path from 'path';
+import { readFileSync } from 'node:fs';
+import { pluginNeedsUpdate } from '../../src/main/agent-plugin-file';
 
 /**
  * Issue #231 — the SHIPPED extension, not a copy of its logic.
@@ -69,7 +71,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  for (const key of ['WMUX', 'WMUX_SURFACE_ID', 'WMUX_CLI', 'WMUX_NODE', 'WMUX_NODE_ELECTRON']) {
+  for (const key of ['WMUX', 'WMUX_SURFACE_ID', 'WMUX_CLI', 'WMUX_NODE', 'WMUX_NODE_ELECTRON', 'PI_IMAGE_PROTOCOL']) {
     if (savedEnv[key] === undefined) delete process.env[key];
     else process.env[key] = savedEnv[key];
   }
@@ -81,14 +83,31 @@ describe('#231 pi extension: activation', () => {
     // pi loads global extensions for every session on the machine, including
     // ones started from a plain terminal. Registering handlers there would
     // spawn a CLI process per event for a wmux that is not running.
-    const pi = await extensionWith({ WMUX: '0' });
+    const pi = await extensionWith({ WMUX: '0', PI_IMAGE_PROTOCOL: undefined });
     expect(pi.handlers.size).toBe(0);
     expect(calls).toEqual([]);
+    expect(process.env.PI_IMAGE_PROTOCOL).toBeUndefined();
   });
 
   it('is inert with no surface id', async () => {
     const pi = await extensionWith({ WMUX_SURFACE_ID: undefined });
     expect(pi.handlers.size).toBe(0);
+  });
+
+  it('enables iTerm2 images during extension loading inside wmux', async () => {
+    await extensionWith({ PI_IMAGE_PROTOCOL: undefined });
+    expect(process.env.PI_IMAGE_PROTOCOL).toBe('iterm2');
+    expect(calls).toEqual([]);
+  });
+
+  it.each(['none', 'kitty', 'auto', 'iterm2'])('preserves the explicit image protocol %s', async (protocol) => {
+    await extensionWith({ PI_IMAGE_PROTOCOL: protocol });
+    expect(process.env.PI_IMAGE_PROTOCOL).toBe(protocol);
+  });
+
+  it('updates previously installed extensions through the version marker', () => {
+    const source = readFileSync(EXTENSION, 'utf8');
+    expect(pluginNeedsUpdate(source, '// wmux-plugin-version: 1\nold source')).toBe(true);
   });
 
   it('runs the CLI through WMUX_NODE, never the host binary (#187)', async () => {

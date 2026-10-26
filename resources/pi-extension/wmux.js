@@ -1,4 +1,4 @@
-// wmux-plugin-version: 1
+// wmux-plugin-version: 2
 // wmux pi extension — bridges pi's lifecycle events to the wmux sidebar (#231).
 // Auto-installed by wmux to ~/.pi/agent/extensions/wmux.js.
 // No-ops entirely outside wmux (WMUX !== '1').
@@ -207,6 +207,11 @@ export default function wmuxExtension(pi) {
   // Outside wmux this file is inert. pi loads global extensions for every
   // session on the machine, including ones started from a plain terminal.
   if (process.env.WMUX !== "1" || !surface) return;
+
+  // Pi cannot detect wmux's iTerm2 image support. Set this before its UI starts,
+  // without overriding an explicit choice. Pi disables iTerm2 images in
+  // fullscreen mode; use --tui-mode regular to display them.
+  process.env.PI_IMAGE_PROTOCOL ??= "iterm2";
 
   const runtime = resolveNodeRuntime();
 
