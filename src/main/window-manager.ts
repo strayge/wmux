@@ -181,6 +181,8 @@ interface WindowEntry {
    * and which need a restart.
    */
   transparent: boolean;
+  /** Applied backdrop; null if a failed native change may have partly applied. */
+  backdrop: { enabled: boolean; material: WindowMaterial } | null;
   /** A close-confirm dialog is on screen for this window (issue #227). */
   closePending: boolean;
   /** The user answered that dialog with "close"; the re-issued close goes through. */
@@ -307,7 +309,11 @@ export class WindowManager {
       this.onWindowClosed?.(id, webContentsId);
     });
 
-    const entry: WindowEntry = { id, window: win, transparent, closePending: false, closeConfirmed: false, sessionFlushed: false };
+    const entry: WindowEntry = {
+      id, window: win, transparent,
+      backdrop: { enabled: translucent, material: backdrop.material },
+      closePending: false, closeConfirmed: false, sessionFlushed: false,
+    };
     // Every route to a window close lands here — the caption ×, Alt+F4, the
     // renderer's closeWindow shortcut (`window.close()`), the frameless
     // caption's closeSelf — so this is the one place the guard can sit.
@@ -557,20 +563,31 @@ export class WindowManager {
       // setBackgroundColor re-lands an opaque surface. Nothing to apply — the
       // opacity itself is a renderer-side alpha, not a window property.
       if (wantsTransparent) continue;
-      applyOpaqueBackdrop(entry.window, enabled, material);
+      // The renderer reasserts its prefs on mount. On Win11 even setting an
+      // already-disabled material to 'none' rebuilds native transparency and
+      // can flash the whole window white, despite ready-to-show and dark CSS.
+      // Skip unchanged native state; a disabled backdrop ignores its material.
+      if (entry.backdrop && entry.backdrop.enabled === enabled &&
+          (!enabled || entry.backdrop.material === material)) continue;
+      entry.backdrop = applyOpaqueBackdrop(entry.window, enabled, material)
+        ? { enabled, material }
+        : null;
     }
     return { needsRestart };
   }
 }
 
 /** The live half of setBackdrop, for a window built with an opaque backing. */
-function applyOpaqueBackdrop(win: BrowserWindow, enabled: boolean, material: WindowMaterial): void {
+function applyOpaqueBackdrop(win: BrowserWindow, enabled: boolean, material: WindowMaterial): boolean {
   try {
     win.setBackgroundColor(enabled ? TRANSPARENT_BG : OPAQUE_BG);
     if (supportsBackdropMaterial()) {
       win.setBackgroundMaterial(enabled && material !== 'clear' ? material : 'none');
     }
+    return true;
   } catch {
-    // Window went away mid-loop, or the platform rejected the material.
+    // Window went away mid-loop, or the platform rejected the material. The
+    // caller invalidates its cache: even returning to the old state must retry.
+    return false;
   }
 }
