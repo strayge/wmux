@@ -24,6 +24,7 @@ import {
   takeMouseModeReplay,
 } from '../utils/mouse-modes';
 import { attachVisibleRenderer, RendererHandle } from '../utils/terminal-renderer';
+import { terminalNeedsTransparency } from '../utils/terminal-theme';
 import { resetTerminalModes } from '../utils/terminal-reset';
 import { trackScreenEvents } from '../utils/screen-report';
 import {
@@ -942,9 +943,10 @@ export function useTerminal({ surfaceId, shell, cwd, visible = true, focused = t
 
     // Create terminal instance. Theme/font are applied from settings on creation
     // AND kept in sync via a later effect, so live edits repaint without recreation.
+    const initialBackground = withBgAlpha('#272822', bgAlpha);
     const terminal = new Terminal({
       theme: {
-        background: '#272822',
+        background: initialBackground,
         foreground: '#fdfff1',
         cursor: '#c0c1b5',
         selectionBackground: '#57584f',
@@ -954,11 +956,10 @@ export function useTerminal({ surfaceId, shell, cwd, visible = true, focused = t
       fontSize: prefs.fontSize || 13,
       cursorBlink: prefs.cursorBlink ?? true,
       cursorStyle: prefs.cursorStyle || 'block',
-      // Always on: with an opaque background it renders identically, and the
-      // WebGL context's alpha mode is fixed at creation — so this must not
-      // depend on whether the custom background (issue #89) is currently
-      // enabled, or toggling it would require recreating every terminal.
-      allowTransparency: true,
+      // A transparent glyph atlas loses subpixel text AA even when the window
+      // is opaque. Follow the effective background; the resolved theme and
+      // later appearance changes update this when applying the theme below.
+      allowTransparency: terminalNeedsTransparency(initialBackground),
       allowProposedApi: true,
       // Read at click time, so referencing `terminal` here is safe (#280).
       linkHandler: links.linkHandler,
@@ -2079,9 +2080,11 @@ export function useTerminal({ surfaceId, shell, cwd, visible = true, focused = t
     if (!term) return;
     let cancelled = false;
     fetchTheme(schemeName).then((base) => {
-      if (cancelled || !xtermRef.current) return;
+      if (cancelled || xtermRef.current !== term) return;
       const theme = buildXtermTheme(base, userScheme, bgAlpha);
-      xtermRef.current.options.theme = theme;
+      // Apply transparency first so the theme update also invalidates WebGL's render model.
+      term.options.allowTransparency = terminalNeedsTransparency(theme.background);
+      term.options.theme = theme;
       // xterm paints the theme background on .xterm-scrollable-element, which
       // sits INSIDE .xterm's 2px padding — so over a translucent window that
       // padding was a fully see-through frame around every pane. Publishing the
