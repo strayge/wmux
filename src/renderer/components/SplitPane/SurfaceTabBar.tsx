@@ -368,6 +368,16 @@ export default function SurfaceTabBar({
               role="tab"
               aria-selected={isActive}
               onClick={() => onSelect(index)}
+              onMouseDown={(e) => {
+                // Autoscroll starts on press, before the middle-button auxclick.
+                if (e.button === 1) e.preventDefault();
+              }}
+              onAuxClick={(e) => {
+                if (e.button !== 1) return;
+                e.preventDefault();
+                e.stopPropagation();
+                onClose(surface.id);
+              }}
               onDoubleClick={() => {
                 setRenamingId(surface.id);
                 setRenameValue(surface.customTitle || '');

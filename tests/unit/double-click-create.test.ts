@@ -69,6 +69,11 @@ function doubleClick(target: Element, button = 0): void {
 function click(target: HTMLElement): void {
   act(() => target.click());
 }
+function auxClick(target: Element, button = 1): MouseEvent {
+  const event = new MouseEvent('auxclick', { bubbles: true, cancelable: true, button });
+  act(() => { target.dispatchEvent(event); });
+  return event;
+}
 function transfer() {
   const data = new Map<string, string>();
   return {
@@ -109,6 +114,58 @@ function renderSidebar(overrides: Partial<React.ComponentProps<typeof Sidebar>> 
   act(() => root.render(React.createElement(Sidebar, props)));
   return props;
 }
+
+describe('middle-click tab close', () => {
+  it.each([
+    ['.surface-tab', 'a'],
+    ['.surface-tab:nth-child(2)', 'b'],
+    ['.surface-tab__label', 'a'],
+    ['.surface-tab__icon', 'a'],
+    ['.surface-tab__close', 'a'],
+  ])('closes the clicked tab once through %s without selecting it', (selector, id) => {
+    const props = renderTabs();
+    expect(auxClick(element(selector)).defaultPrevented).toBe(true);
+    expect(props.onClose).toHaveBeenCalledExactlyOnceWith(id);
+    expect(props.onSelect).not.toHaveBeenCalled();
+    expect(props.onNew).not.toHaveBeenCalled();
+  });
+
+  it('uses the existing close action for the last tab too', () => {
+    const props = renderTabs({ surfaces: surfaces.slice(0, 1) });
+    expect(container.querySelector('.surface-tab__close')).toBeNull();
+    auxClick(element('.surface-tab'));
+    expect(props.onClose).toHaveBeenCalledExactlyOnceWith(surfaces[0].id);
+  });
+
+  it('ignores primary and secondary auxiliary clicks', () => {
+    const props = renderTabs();
+    for (const button of [0, 2]) {
+      expect(auxClick(element('.surface-tab'), button).defaultPrevented).toBe(false);
+    }
+    expect(props.onClose).not.toHaveBeenCalled();
+  });
+
+  it('does not close tabs or create new ones from middle-clicks outside a tab', () => {
+    const props = renderTabs();
+    for (const selector of ['.surface-tab-bar', '.surface-tab-bar__tabs', '.surface-tab-bar__ctl--new']) {
+      auxClick(element(selector));
+    }
+    expect(props.onClose).not.toHaveBeenCalled();
+    expect(props.onNew).not.toHaveBeenCalled();
+  });
+
+  it('prevents middle-button autoscroll on press but closes only on release', () => {
+    const props = renderTabs();
+    for (const button of [0, 1, 2]) {
+      const event = new MouseEvent('mousedown', { bubbles: true, cancelable: true, button });
+      act(() => { element('.surface-tab__label').dispatchEvent(event); });
+      expect(event.defaultPrevented).toBe(button === 1);
+    }
+    expect(props.onClose).not.toHaveBeenCalled();
+    auxClick(element('.surface-tab__label'));
+    expect(props.onClose).toHaveBeenCalledOnce();
+  });
+});
 
 describe('double-click empty tab-strip space', () => {
   it.each(['.surface-tab-bar__tabs', '.surface-tab-bar'])(
