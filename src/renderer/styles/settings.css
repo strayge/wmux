@@ -174,7 +174,7 @@
 .settings-label {
   font-size: 13px;
   color: rgba(var(--ui-overlay-rgb), 0.8);
-  flex-shrink: 0;
+  overflow-wrap: anywhere;
 }
 
 .settings-value {
