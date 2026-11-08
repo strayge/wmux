@@ -51,7 +51,7 @@ export default function AgentBrowserViewer({ surfaceId, visible, focused, onActi
   const [hasFrame, setHasFrame] = useState(false);
   const [recovering, setRecovering] = useState(false);
   const reconnect = useRef<() => void>(() => {});
-  const composing = useRef(false);
+  const composing = useRef<{ token: string; revision: number; generation: number; interactive: boolean } | null>(null);
   const committedComposition = useRef<string | null>(null);
   const wheelHandler = useRef<(event: WheelEvent) => void>(() => {});
 
@@ -99,6 +99,11 @@ export default function AgentBrowserViewer({ surfaceId, visible, focused, onActi
     let pendingSize: { width: number; height: number; revision: number } | undefined;
     let lastSize = '';
     let activeTab: string | undefined;
+    let activeUrl: string | undefined;
+    const observeUrl = (url: string) => {
+      if (activeUrl !== undefined && activeUrl !== url && composing.current) composing.current.interactive = false;
+      activeUrl = url;
+    };
     const resize = async () => {
       if (resizing || !state.current.ready || disposed || !isVisible.current || document.hidden) return;
       resizing = true;
@@ -159,6 +164,7 @@ export default function AgentBrowserViewer({ surfaceId, visible, focused, onActi
       pendingSize = undefined;
       lastSize = '';
       activeTab = undefined;
+      activeUrl = undefined;
       setError('');
       setHasFrame(false);
       setConnected(false);
@@ -203,11 +209,17 @@ export default function AgentBrowserViewer({ surfaceId, visible, focused, onActi
           callbacks.current.onConnection?.(message.connected);
           measure();
           break;
-        case 'url': callbacks.current.onPageState(message.url); break;
+        case 'url':
+          observeUrl(message.url);
+          callbacks.current.onPageState(message.url);
+          break;
         case 'tabs': {
           callbacks.current.onTabs?.(message.tabs);
           const active = message.tabs.find((tab) => tab.active);
-          if (active) callbacks.current.onPageState(active.url, active.title);
+          if (active) {
+            observeUrl(active.url);
+            callbacks.current.onPageState(active.url, active.title);
+          }
           if (active?.tabId !== activeTab) {
             activeTab = active?.tabId;
             lastSize = '';
@@ -298,6 +310,12 @@ export default function AgentBrowserViewer({ surfaceId, visible, focused, onActi
       });
     }
   };
+  const commitText = (value: string) => {
+    if (!value) return;
+    if (value.length <= 2 && Array.from(value).length === 1) {
+      input({ type: 'input_keyboard', eventType: 'char', text: value, windowsVirtualKeyCode: 0, modifiers: 0 });
+    } else action({ type: 'insert-text', text: value });
+  };
   const mouse = (e: React.PointerEvent<HTMLCanvasElement> | WheelEvent, eventType: 'mouseMoved' | 'mousePressed' | 'mouseReleased' | 'mouseWheel') => {
     const el = canvas.current;
     if (!el) return;
@@ -350,11 +368,19 @@ export default function AgentBrowserViewer({ surfaceId, visible, focused, onActi
     <textarea ref={keyboard} aria-label="Agent browser page input" autoCapitalize="off" autoCorrect="off" spellCheck={false}
       style={{ position: 'absolute', left: 0, top: 0, width: 1, height: 1, opacity: 0, pointerEvents: 'none' }}
       onKeyDown={(e) => key(e, 'keyDown')} onKeyUp={(e) => key(e, 'keyUp')}
-      onCompositionStart={() => { composing.current = true; committedComposition.current = null; }}
+      onCompositionStart={() => {
+        const { token, revision, ready, drawnRevision } = state.current;
+        composing.current = { token, revision, generation: visibilityGeneration.current,
+          interactive: visible && !document.hidden && ready && drawnRevision === revision };
+        committedComposition.current = null;
+      }}
       onCompositionEnd={(e) => {
-        composing.current = false;
+        const origin = composing.current;
+        composing.current = null;
         committedComposition.current = e.data;
-        if (e.data) input({ type: 'input_keyboard', eventType: 'char', text: e.data, windowsVirtualKeyCode: 0, modifiers: 0 });
+        // A deferred commit belongs to its original interactive page, not a newly drawn tab.
+        if (origin?.interactive && origin.token === state.current.token && origin.revision === state.current.revision
+          && origin.generation === visibilityGeneration.current) commitText(e.data);
         e.currentTarget.value = '';
       }}
       onInput={(e) => {
@@ -366,7 +392,7 @@ export default function AgentBrowserViewer({ surfaceId, visible, focused, onActi
           return;
         }
         committedComposition.current = null;
-        if (value) input({ type: 'input_keyboard', eventType: 'char', text: value, windowsVirtualKeyCode: 0, modifiers: 0 });
+        commitText(value);
         e.currentTarget.value = '';
       }}
       onPaste={(e) => { e.preventDefault(); action({ type: 'paste' }); }}

@@ -91,24 +91,121 @@ describe('renderer stream/input bridge', () => {
     expect(api.ack).toHaveBeenLastCalledWith('surf-renderer', expect.any(String), 3, false);
   });
 
-  it('sends Unicode once and avoids duplicating committed composition', async () => {
+  it('keeps single-codepoint Unicode on the stream and inserts long composition exactly once', async () => {
     await render();
     await event({ type: 'status', connected: true, width: 900, height: 640 });
     await present();
     await dispatchKey('keydown', 'a', 'KeyA', 65);
-    await dispatchText('a✓');
+    await dispatchText('a');
     await dispatchKey('keyup', 'a', 'KeyA', 65);
+    await dispatchText('✓');
+    await dispatchText('🙂');
+    const composition = '日本語入力テスト café 漢字 🙂 "quoted"\nnext line';
     await act(async () => textarea().dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true })));
-    await dispatchText('漢', 'insertCompositionText', true);
-    await act(async () => textarea().dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '漢字' })));
-    await dispatchText('漢字', 'insertFromComposition');
+    await dispatchText('日本語', 'insertCompositionText', true);
+    await act(async () => textarea().dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: composition })));
+    await dispatchText(composition, 'insertFromComposition');
     const inputs = vi.mocked(api.input).mock.calls.map((call) => call[3]);
     expect(inputs).toEqual([
       expect.objectContaining({ eventType: 'rawKeyDown', key: 'a' }),
-      expect.objectContaining({ eventType: 'char', text: 'a✓' }),
+      expect.objectContaining({ eventType: 'char', text: 'a' }),
       expect.objectContaining({ eventType: 'keyUp', key: 'a' }),
-      expect.objectContaining({ eventType: 'char', text: '漢字' }),
+      expect.objectContaining({ eventType: 'char', text: '✓' }),
+      expect.objectContaining({ eventType: 'char', text: '🙂' }),
     ]);
+    expect(vi.mocked(api.action).mock.calls.map((call) => call[3])).toEqual([{ type: 'insert-text', text: composition }]);
+    expect(textarea().value).toBe('');
+    await dispatchText('textarea bulk text');
+    expect(api.action).toHaveBeenLastCalledWith('surf-renderer', expect.any(String), 1, { type: 'insert-text', text: 'textarea bulk text' });
+    expect(api.input).toHaveBeenCalledTimes(5);
+  });
+
+  it.each(['tab', 'token', 'visibility', 'undrawn'])('drops pending composition after %s invalidation and permits fresh composition', async (change) => {
+    vi.useFakeTimers();
+    await render();
+    await event({ type: 'status', connected: true, width: 900, height: 640 });
+    if (change !== 'undrawn') await present();
+    await act(async () => textarea().dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true })));
+    await dispatchText('日本語', 'insertCompositionText', true);
+    let revision = 1;
+    if (change === 'tab') {
+      revision = 2;
+      await event({ type: 'tabs', tabs: [{ tabId: 't2', title: 'Other', url: 'https://other.test/', active: true }] }, revision);
+    } else if (change === 'token') {
+      await event({ type: 'error', message: 'Disconnected' });
+      const reconnect = Array.from(container.querySelectorAll('button')).find((button) => button.textContent === 'Reconnect / Continue')!;
+      await act(async () => reconnect.click());
+      revision = 0;
+      await event({ type: 'status', connected: true, width: 900, height: 640 }, revision);
+    } else if (change === 'visibility') {
+      await render(false);
+      await render(true);
+    }
+    await present(revision);
+    const oldText = '日本語入力テスト 🙂 "old composition"';
+    await act(async () => textarea().dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: oldText })));
+    await dispatchText(oldText, 'insertFromComposition');
+    expect(api.input).not.toHaveBeenCalled();
+    expect(vi.mocked(api.action).mock.calls.filter((call) => call[3].type === 'insert-text')).toEqual([]);
+    expect(textarea().value).toBe('');
+    const freshText = '新しい入力テスト 🙂';
+    await act(async () => textarea().dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true })));
+    await dispatchText('新しい', 'insertCompositionText', true);
+    await act(async () => textarea().dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: freshText })));
+    await dispatchText(freshText, 'insertFromComposition');
+    expect(api.input).not.toHaveBeenCalled();
+    const token = vi.mocked(api.reconnect).mock.calls.at(-1)?.[2] ?? vi.mocked(api.attach).mock.calls[0][1];
+    expect(vi.mocked(api.action).mock.calls.filter((call) => call[3].type === 'insert-text')).toEqual([
+      ['surf-renderer', token, revision, { type: 'insert-text', text: freshText }],
+    ]);
+  });
+
+  it.each(['url', 'tabs'])('drops pending composition on observed same-tab navigation through %s, even after returning to the original URL', async (source) => {
+    vi.useFakeTimers();
+    await render();
+    await event({ type: 'status', connected: true, width: 900, height: 640 });
+    const metadata = async (url: string) => event(source === 'url' ? { type: 'url', url }
+      : { type: 'tabs', tabs: [{ tabId: 't1', title: 'Page', url, active: true }] });
+    await metadata('https://a.test/');
+    await present();
+    await act(async () => textarea().dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true })));
+    await dispatchText('日本語', 'insertCompositionText', true);
+    await metadata('https://b.test/');
+    await present();
+    await metadata('https://a.test/');
+    await present();
+    const oldText = '日本語入力テスト from page A';
+    await act(async () => textarea().dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: oldText })));
+    await dispatchText(oldText, 'insertFromComposition');
+    expect(api.input).not.toHaveBeenCalled();
+    expect(vi.mocked(api.action).mock.calls.filter((call) => call[3].type === 'insert-text')).toEqual([]);
+    expect(textarea().value).toBe('');
+    const freshText = '新しい入力テスト';
+    await act(async () => textarea().dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true })));
+    await metadata('https://a.test/');
+    await act(async () => textarea().dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: freshText })));
+    await dispatchText(freshText, 'insertFromComposition');
+    expect(api.input).not.toHaveBeenCalled();
+    expect(vi.mocked(api.action).mock.calls.filter((call) => call[3].type === 'insert-text').map((call) => call[3])).toEqual([
+      { type: 'insert-text', text: freshText },
+    ]);
+  });
+
+  it('preserves healthy composition through initial URL acquisition, identical URLs and title-only metadata', async () => {
+    vi.useFakeTimers();
+    await render();
+    await event({ type: 'status', connected: true, width: 900, height: 640 });
+    await present();
+    await act(async () => textarea().dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true })));
+    await event({ type: 'url', url: 'https://a.test/' });
+    await event({ type: 'tabs', tabs: [{ tabId: 't1', title: 'A', url: 'https://a.test/', active: true }] });
+    await event({ type: 'url', url: 'https://a.test/' });
+    await event({ type: 'tabs', tabs: [{ tabId: 't1', title: 'New title', url: 'https://a.test/', active: true }] });
+    const text = '日本語入力テスト';
+    await act(async () => textarea().dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: text })));
+    await dispatchText(text, 'insertFromComposition');
+    expect(api.input).not.toHaveBeenCalled();
+    expect(api.action).toHaveBeenCalledExactlyOnceWith('surf-renderer', expect.any(String), 1, { type: 'insert-text', text });
   });
 
   it('keeps copy/paste finite and lets outer-tab shortcuts bubble without forwarding to Chrome', async () => {
@@ -144,23 +241,26 @@ describe('renderer stream/input bridge', () => {
     expect(api.action).not.toHaveBeenCalled();
     await present();
     await dispatchText('tab A');
-    expect(api.input).toHaveBeenCalledOnce();
-    vi.mocked(api.input).mockClear();
+    expect(api.action).toHaveBeenCalledExactlyOnceWith('surf-renderer', expect.any(String), 1, { type: 'insert-text', text: 'tab A' });
+    vi.mocked(api.action).mockClear();
     await event({ type: 'tabs', tabs: [{ tabId: 't2', title: 'B', url: 'https://b.test/', active: true }] }, 2);
     await tryInput();
     expect(api.input).not.toHaveBeenCalled();
+    expect(api.action).not.toHaveBeenCalled();
     await present(2);
     await dispatchText('tab B');
-    expect(api.input).toHaveBeenCalledOnce();
-    vi.mocked(api.input).mockClear();
+    expect(api.action).toHaveBeenCalledExactlyOnceWith('surf-renderer', expect.any(String), 2, { type: 'insert-text', text: 'tab B' });
+    vi.mocked(api.action).mockClear();
     await render(false);
     await render(true);
     await event({ type: 'status', connected: true, width: 900, height: 640 }, 2);
+    vi.mocked(api.action).mockClear();
     await tryInput();
     expect(api.input).not.toHaveBeenCalled();
+    expect(api.action).not.toHaveBeenCalled();
     await present(2);
     await dispatchText('reattached');
-    expect(api.input).toHaveBeenCalledOnce();
+    expect(api.action).toHaveBeenCalledExactlyOnceWith('surf-renderer', expect.any(String), 2, { type: 'insert-text', text: 'reattached' });
   });
 
   it('drains newest-tab sizing after obsolete in-flight resize rejection without a permanent error', async () => {
@@ -307,6 +407,7 @@ describe('renderer stream/input bridge', () => {
     await event({ type: 'status', connected: true, width: 900, height: 640 });
     await dispatchText('paused');
     expect(api.input).not.toHaveBeenCalled();
+    expect(vi.mocked(api.action).mock.calls.filter((call) => call[3].type === 'insert-text')).toEqual([]);
     const reconnect = Array.from(container.querySelectorAll('button')).find((button) => button.textContent === 'Reconnect / Continue')!;
     await act(async () => reconnect.click());
     expect(api.reconnect).toHaveBeenCalledExactlyOnceWith('surf-renderer', oldToken, expect.not.stringMatching(oldToken));
@@ -314,7 +415,7 @@ describe('renderer stream/input bridge', () => {
     await event({ type: 'status', connected: true, width: 900, height: 640 }, 0);
     await present(0);
     await dispatchText('continued');
-    expect(api.input).toHaveBeenCalledOnce();
+    expect(api.action).toHaveBeenLastCalledWith('surf-renderer', expect.any(String), 0, { type: 'insert-text', text: 'continued' });
     await act(async () => decode[0].onload?.(new Event('load')));
     expect(draw).toHaveBeenCalledOnce();
     expect(api.ack).toHaveBeenLastCalledWith('surf-renderer', oldToken, 1, false);

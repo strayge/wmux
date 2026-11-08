@@ -38,7 +38,7 @@ function harness() {
     replaceSession: () => { session = { ...SESSION }; } };
 }
 
-const key = { type: 'input_keyboard', eventType: 'char', text: '✓漢字', windowsVirtualKeyCode: 0, modifiers: 0 };
+const key = { type: 'input_keyboard', eventType: 'char', text: '✓', windowsVirtualKeyCode: 0, modifiers: 0 };
 
 describe('surface stream subscriptions', () => {
   it('resolves only the registered loopback endpoint and relays finite page state', () => {
@@ -348,7 +348,53 @@ describe('finite native actions and input', () => {
     expect(h.run).toHaveBeenCalledOnce();
   });
 
-  it('preserves resize -> paste -> subsequent typing/pointer receive order across native work', async () => {
+  it('inserts committed text only inside a main-owned literal without clipboard access', async () => {
+    const h = harness();
+    h.present();
+    const value = '--version --json\n日本語入力テスト café 🙂 ");throw new Error("injected");//';
+    await h.viewer.action(ID, 10, 'token-a', 1, { type: 'insert-text', text: value, js: 'renderer script', argv: ['close'] });
+    expect(h.run).toHaveBeenCalledOnce();
+    const argv = h.run.mock.calls[0][1];
+    expect(argv).toEqual(['eval', `document.execCommand('insertText', false, ${JSON.stringify(value)})`]);
+    const insert = vi.fn(() => true);
+    new Function('document', `return ${argv[1]}`)({ execCommand: insert });
+    expect(insert).toHaveBeenCalledExactlyOnceWith('insertText', false, value);
+    expect(h.readClipboard).not.toHaveBeenCalled();
+    expect(h.writeClipboard).not.toHaveBeenCalled();
+    expect(h.sockets[0].send).not.toHaveBeenCalled();
+  });
+
+  it('rejects malformed/raw/encoded text caps before queue retention and leaves empty insertion a no-op', async () => {
+    const h = harness();
+    h.present();
+    let finish!: (result: typeof ok) => void;
+    h.run.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const resize = h.viewer.action(ID, 10, 'token-a', 1, { type: 'viewport', width: 900, height: 640 });
+    await vi.waitFor(() => expect(finish).toBeTypeOf('function'));
+    await h.viewer.action(ID, 10, 'token-a', 1, { type: 'insert-text', text: '' });
+    for (const value of [undefined, 7, {}, 'x'.repeat(12001), 'x'.repeat(12000), '"'.repeat(6000), '\u0000'.repeat(2500)]) {
+      await expect(h.viewer.action(ID, 10, 'token-a', 1, { type: 'insert-text', text: value })).rejects.toThrow(/text|Text/);
+      expect(h.viewer.canAct(ID)).toBe(true);
+    }
+    expect(h.run).toHaveBeenCalledOnce();
+    const insertion = h.viewer.action(ID, 10, 'token-a', 1, { type: 'insert-text', text: 'still healthy' });
+    finish(ok);
+    await Promise.all([resize, insertion]);
+    expect(h.run).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['owner', 'token', 'revision', 'undrawn', 'hidden', 'tab'])('rejects committed text against %s-stale input state', async (state) => {
+    const h = harness();
+    if (state !== 'undrawn') h.present();
+    if (state === 'hidden') await h.viewer.action(ID, 10, 'token-a', 1, { type: 'visibility', visible: false });
+    if (state === 'tab') h.receive({ ...protocol.tabs, tabs: [{ ...protocol.tabs.tabs[0], tabId: 't2' }] });
+    await expect(h.viewer.action(ID, state === 'owner' ? 99 : 10, state === 'token' ? 'old-token' : 'token-a',
+      state === 'revision' ? 0 : state === 'tab' ? 2 : 1, { type: 'insert-text', text: '日本語入力テスト' })).rejects.toThrow();
+    expect(h.run).not.toHaveBeenCalled();
+    expect(h.viewer.canAct(ID)).toBe(true);
+  });
+
+  it('preserves resize -> paste -> committed text -> typing/pointer receive order across native work', async () => {
     const h = harness();
     h.present();
     const order: string[] = [];
@@ -361,6 +407,7 @@ describe('finite native actions and input', () => {
       order.push('paste');
       return new Promise((resolve) => { finishPaste = resolve; });
     });
+    h.run.mockImplementationOnce(async () => { order.push('committed text'); return ok; });
     h.sockets[0].send.mockImplementation((payload: string) => {
       const input = JSON.parse(payload);
       order.push(input.type === 'input_keyboard' ? 'typing' : 'pointer');
@@ -368,15 +415,16 @@ describe('finite native actions and input', () => {
     const resize = h.viewer.action(ID, 10, 'token-a', 1, { type: 'viewport', width: 900, height: 640 });
     await vi.waitFor(() => expect(order).toEqual(['resize']));
     const paste = h.viewer.action(ID, 10, 'token-a', 1, { type: 'paste' });
-    const typing = h.viewer.input(ID, 10, 'token-a', 1, { ...key, text: 'typed after paste' });
+    const committed = h.viewer.action(ID, 10, 'token-a', 1, { type: 'insert-text', text: '日本語入力テスト' });
+    const typing = h.viewer.input(ID, 10, 'token-a', 1, { ...key, text: '字' });
     const pointer = h.viewer.input(ID, 10, 'token-a', 1, { type: 'input_mouse', eventType: 'mousePressed', x: 10, y: 20, button: 'left', clickCount: 1, modifiers: 0 });
     expect(order).toEqual(['resize']);
     finishResize(ok);
     await resize;
     await vi.waitFor(() => expect(order).toEqual(['resize', 'paste']));
     finishPaste(ok);
-    await Promise.all([paste, typing, pointer]);
-    expect(order).toEqual(['resize', 'paste', 'typing', 'pointer']);
+    await Promise.all([paste, committed, typing, pointer]);
+    expect(order).toEqual(['resize', 'paste', 'committed text', 'typing', 'pointer']);
   });
 
   it.each(['tab', 'subscription'])('drops queued old input/paste and does not pause a replacement %s on a late native failure', async (replacement) => {
@@ -388,6 +436,7 @@ describe('finite native actions and input', () => {
     await vi.waitFor(() => expect(failOld).toBeTypeOf('function'));
     const oldPaste = h.viewer.action(ID, 10, 'token-a', 1, { type: 'paste' }).catch((err) => err);
     const oldInput = h.viewer.input(ID, 10, 'token-a', 1, key);
+    const oldCommitted = h.viewer.action(ID, 10, 'token-a', 1, { type: 'insert-text', text: '日本語入力テスト' }).catch((err) => err);
     let token = 'token-a', revision = 2;
     if (replacement === 'subscription') {
       token = 'token-b'; revision = 0;
@@ -395,15 +444,29 @@ describe('finite native actions and input', () => {
       h.receive(protocol.status);
     } else h.receive({ ...protocol.tabs, tabs: [{ ...protocol.tabs.tabs[0], tabId: 't2' }] });
     h.present(token);
-    const newInput = h.viewer.input(ID, 10, token, revision, { ...key, text: 'new page input' });
+    const newInput = h.viewer.input(ID, 10, token, revision, { ...key, text: '新' });
     failOld({ ...ok, ok: false, stderr: 'old native failure' });
     await Promise.all([oldResize, oldPaste, oldInput, newInput]);
+    expect(await oldCommitted).toBeInstanceOf(Error);
     expect(h.run).toHaveBeenCalledOnce();
     expect(h.viewer.canAct(ID)).toBe(true);
     expect(h.events.filter((event) => event.message.type === 'error')).toEqual([]);
     expect(h.sockets.at(-1)!.send.mock.calls.map((call) => JSON.parse(call[0]))).toEqual([
-      expect.objectContaining({ type: 'input_keyboard', text: 'new page input' }),
+      expect.objectContaining({ type: 'input_keyboard', text: '新' }),
     ]);
+  });
+
+  it('drops committed text queued before a hide/return, without replay after a fresh frame', async () => {
+    const h = harness();
+    h.present();
+    const insertion = h.viewer.action(ID, 10, 'token-a', 1, { type: 'insert-text', text: '日本語入力テスト' }).catch((err) => err);
+    await h.viewer.action(ID, 10, 'token-a', 1, { type: 'visibility', visible: false });
+    await h.viewer.action(ID, 10, 'token-a', 1, { type: 'visibility', visible: true });
+    expect(await insertion).toBeInstanceOf(Error);
+    h.viewer.ack(ID, 10, 'token-a', 2, true);
+    expect(h.run).not.toHaveBeenCalled();
+    await h.viewer.action(ID, 10, 'token-a', 1, { type: 'insert-text', text: 'fresh commit' });
+    expect(h.run).toHaveBeenCalledOnce();
   });
 
   it('bounds input queued behind native work and pauses instead of accumulating indefinitely', async () => {
@@ -717,6 +780,11 @@ describe('finite native actions and input', () => {
     expect(validatedViewerInput({ ...key, method: 'Browser.close', argv: ['close'] })).toEqual(key);
     expect(validatedViewerInput({ ...key, modifiers: 32 })).toBeNull();
     expect(validatedViewerInput({ ...key, eventType: 'execute' })).toBeNull();
+    expect(validatedViewerInput({ ...key, text: '日本語入力テスト' })).toBeNull();
+    expect(validatedViewerInput({ ...key, text: 'ab' })).toBeNull();
+    expect(validatedViewerInput({ ...key, text: '🙂' })).toMatchObject({ text: '🙂' });
+    expect(validatedViewerInput({ ...key, eventType: 'keyDown', key: 'Enter', text: '\r' })).toMatchObject({ text: '\r' });
+    expect(validatedViewerInput({ ...key, eventType: 'keyDown', key: 'Control', text: undefined })).not.toBeNull();
     const mouse = { type: 'input_mouse', eventType: 'mouseWheel', x: 12, y: 30, button: 'none', clickCount: 0, modifiers: 0, deltaY: 100 };
     expect(validatedViewerInput(mouse)).toMatchObject(mouse);
     expect(validatedViewerInput({ ...mouse, x: Infinity })).toBeNull();

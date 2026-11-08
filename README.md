@@ -87,6 +87,10 @@ The file viewer handles quick edits. Markdown panes render plans and documentati
 
 Open a local development server or documentation in the browser panel with **Ctrl+Shift+I**. The CLI can navigate it, inspect the page, click elements and take screenshots, so you can watch browser work as it happens.
 
+In a browser tab, **Agent** mode shows the Chrome page you and your agent control together. Use **…** for **New tab** or **Show dashboard**; returning to Page keeps the same session.
+
+If Page pauses after a connection failure, choose **Reconnect / Continue**, or **Start new session** to close the old session and open a blank page. Native browser commands can still restart Chrome or leave duplicate daemons; wmux does not prevent those restarts or guarantee cleanup of undetected duplicates.
+
 Links can open in wmux or your system browser; choose the default in **Settings → Browser**.
 
 ### Check in from your phone

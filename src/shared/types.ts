@@ -28,7 +28,7 @@ export type SurfaceType = 'terminal' | 'browser' | 'markdown' | 'diff' | 'code' 
  * `web`   — the Electron <webview>. The default, always, and what every
  *           browser surface was before agent-browser existed.
  * `agent` — vercel-labs/agent-browser: a real Chrome driven by the CLI, shown
- *           through its own dashboard.
+ *           through the Page viewer or its dashboard.
  *
  * Absent means `web`, so an older saved session restores correctly with no
  * migration (session-persistence.ts superset rule, #145).
@@ -51,6 +51,7 @@ export type AgentViewerInput =
 
 export type AgentViewerAction =
   | { type: 'viewport'; width: number; height: number }
+  | { type: 'insert-text'; text: string }
   | { type: 'copy' | 'paste' | 'back' | 'forward' | 'reload' }
   | { type: 'tab-new' }
   | { type: 'navigate'; url: string }

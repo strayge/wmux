@@ -53,7 +53,7 @@ interface Subscription {
 // Bounds queued pointer/key data while a native operation is in flight.
 const MAX_QUEUED_WORK = 256;
 // Windows quoting may double the encoded script; leave room for binary/session flags.
-const MAX_PASTE_SCRIPT_LENGTH = 12000;
+const MAX_INSERT_SCRIPT_LENGTH = 12000;
 
 const dimension = (v: unknown): v is number => Number.isInteger(v) && Number(v) > 0 && Number(v) <= 16384;
 const bounded = (v: unknown, max: number): v is number => typeof v === 'number' && Number.isFinite(v) && Math.abs(v) <= max;
@@ -78,7 +78,8 @@ export function validatedViewerInput(raw: unknown): AgentViewerInput | null {
   if (v.type !== 'input_keyboard' || !member(v.eventType, ['keyDown', 'rawKeyDown', 'keyUp', 'char'])
     || !Number.isInteger(v.windowsVirtualKeyCode) || !bounded(v.windowsVirtualKeyCode, 255)
     || (v.key !== undefined && !text(v.key, 64)) || (v.code !== undefined && !text(v.code, 64))
-    || (v.text !== undefined && !text(v.text))) return null;
+    // Native char packets cannot reliably insert bulk text; use the finite insertion action.
+    || (v.text !== undefined && (!text(v.text, 2) || Array.from(v.text).length > 1))) return null;
   return { type: 'input_keyboard', eventType: v.eventType as 'keyDown', modifiers,
     windowsVirtualKeyCode: v.windowsVirtualKeyCode as number, key: v.key as string | undefined,
     code: v.code as string | undefined, text: v.text as string | undefined };
@@ -89,6 +90,17 @@ const COPY_SELECTION = `(() => { const e = document.activeElement;
   if (e && e.tagName === 'INPUT' && e.type === 'password') return '';
   return e && (e.tagName === 'INPUT' || e.tagName === 'TEXTAREA') && typeof e.selectionStart === 'number'
     ? e.value.slice(e.selectionStart, e.selectionEnd) : String(window.getSelection() || ''); })()`;
+
+/** Paste and committed text share a fixed literal, bounded before the native/input queue retains it. */
+function insertTextArgv(value: unknown): string[] | null {
+  if (!text(value, MAX_INSERT_SCRIPT_LENGTH)) throw new Error('Invalid or oversized page text (limit: 12000 characters).');
+  if (!value) return null;
+  const script = `document.execCommand('insertText', false, ${JSON.stringify(value)})`;
+  if (script.length > MAX_INSERT_SCRIPT_LENGTH) {
+    throw new Error('Text is too large for a Windows browser command (encoded limit: 12000 characters).');
+  }
+  return ['eval', script];
+}
 
 export class AgentBrowserViewer {
   private subscriptions = new Map<SurfaceId, Subscription>();
@@ -340,7 +352,7 @@ export class AgentBrowserViewer {
       return;
     }
     if (!sub.ready || sub.revision !== revision) throw new Error('Page is not interactive');
-    const requireFrame = action.type === 'copy' || action.type === 'paste';
+    const requireFrame = action.type === 'copy' || action.type === 'paste' || action.type === 'insert-text';
     if (requireFrame && (!sub.visible || sub.tabOperation || sub.presentedRevision !== revision)) throw new Error('Page frame is not presented');
     if (action.type === 'tab-new' || action.type === 'tab-select' || action.type === 'tab-close') {
       if (action.type !== 'tab-new' && (typeof action.tabId !== 'string' || !/^t[1-9]\d{0,15}$/.test(action.tabId))) throw new Error('Invalid tab ID');
@@ -351,15 +363,10 @@ export class AgentBrowserViewer {
       case 'viewport':
         if (!sub.visible || !dimension(action.width) || !dimension(action.height)) throw new Error('Invalid viewport');
         argv = ['set', 'viewport', String(action.width), String(action.height)]; break;
-      case 'paste': {
-        const value = this.deps.readClipboard();
-        if (!text(value, 1024 * 1024)) throw new Error('Clipboard text is too large');
-        if (!value) return;
-        const script = `document.execCommand('insertText', false, ${JSON.stringify(value)})`;
-        if (script.length > MAX_PASTE_SCRIPT_LENGTH) {
-          throw new Error('Clipboard text is too large for a Windows browser command (encoded limit: 12000 characters).');
-        }
-        argv = ['eval', script];
+      case 'paste': case 'insert-text': {
+        const insertion = insertTextArgv(action.type === 'insert-text' ? action.text : this.deps.readClipboard());
+        if (!insertion) return;
+        argv = insertion;
         break;
       }
       case 'copy': argv = ['eval', COPY_SELECTION]; break;
