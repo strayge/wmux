@@ -3,6 +3,7 @@ import * as os from 'os';
 import { IPC_CHANNELS, type InsertionResult, type NotificationSoundPickResult, type UpdateTriggerResult,
   type KeepAwakeMode, type KeepAwakeState, type SessionSaveRequest,
   type WorktreeCloseMode, type WorktreeInspectResult, type WorktreeRemoveResult,
+  type AgentViewerBridge, type AgentViewerEvent,
 } from '../shared/types';
 import type { BrowserHistory } from '../shared/browser-history';
 import type { BrowserMenuAction, BrowserMenuItem } from '../shared/browser-context-menu';
@@ -518,6 +519,18 @@ contextBridge.exposeInMainWorld('wmux', {
   // Which engine backs a browser surface, and the setup flow for the one that
   // needs an external binary. Separate from `cdp` above: those verbs act on a
   // surface's engine, these change it.
+  agentViewer: {
+    attach: (surfaceId, token) => ipcRenderer.invoke(IPC_CHANNELS.AGENT_VIEWER_ATTACH, surfaceId, token),
+    detach: (surfaceId, token) => ipcRenderer.send(IPC_CHANNELS.AGENT_VIEWER_DETACH, surfaceId, token),
+    ack: (surfaceId, token, id, drawn) => ipcRenderer.send(IPC_CHANNELS.AGENT_VIEWER_ACK, surfaceId, token, id, drawn),
+    input: (surfaceId, token, revision, input) => ipcRenderer.send(IPC_CHANNELS.AGENT_VIEWER_INPUT, surfaceId, token, revision, input),
+    action: (surfaceId, token, revision, action) => ipcRenderer.invoke(IPC_CHANNELS.AGENT_VIEWER_ACTION, surfaceId, token, revision, action),
+    onEvent: (callback) => {
+      const handler = (_event: Electron.IpcRendererEvent, event: AgentViewerEvent) => callback(event);
+      ipcRenderer.on(IPC_CHANNELS.AGENT_VIEWER_EVENT, handler);
+      return () => { ipcRenderer.removeListener(IPC_CHANNELS.AGENT_VIEWER_EVENT, handler); };
+    },
+  } satisfies AgentViewerBridge,
   agentBrowser: {
     /** `{ installed, dashboardAvailable }` — asked whenever a pane enters agent mode. */
     status: (): Promise<{ installed: boolean; dashboardAvailable: boolean }> =>

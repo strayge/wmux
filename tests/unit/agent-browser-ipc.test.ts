@@ -35,6 +35,11 @@ import type { PaneId, SurfaceId, WorkspaceId, SurfaceRef, SplitNode } from '../.
 // redirected: `PtyLedger.takeOver()` runs at ipc-handlers import time and
 // REWRITES the ledger, which for an unmocked path is the live wmux's own.
 
+const registeredIpc = vi.hoisted(() => ({
+  handles: new Map<string, Function>(),
+  events: new Map<string, Function>(),
+}));
+
 type TestStore = WorkspaceSlice & SurfaceSlice;
 const makeStore = () =>
   create<TestStore>()((...args) => ({
@@ -58,17 +63,22 @@ vi.mock('../../src/shared/instance', async (importOriginal) => ({
   getAppDataDir: () => path.join(os.tmpdir(), 'wmux-agent-browser-ipc-test'),
 }));
 vi.mock('electron', () => ({
-  ipcMain: { on: () => {}, handle: () => {} },
+  ipcMain: {
+    on: (channel: string, handler: Function) => { registeredIpc.events.set(channel, handler); },
+    handle: (channel: string, handler: Function) => { registeredIpc.handles.set(channel, handler); },
+  },
   BrowserWindow: { getAllWindows: () => [], fromWebContents: () => null, getFocusedWindow: () => null },
   clipboard: { readText: () => '', writeText: () => {} },
   shell: {},
   dialog: {},
-  app: { getPath: () => os.tmpdir(), getVersion: () => '0.0.0' },
+  app: { getPath: () => os.tmpdir(), getVersion: () => '0.0.0', on: vi.fn() },
   nativeTheme: { on: () => {} },
 }));
 
 import { initPipeBridge } from '../../src/renderer/pipe-bridge';
 import {
+  authorizeAgentBrowserSurface,
+  registerIpcHandlers,
   agentBrowserCurrentUrl,
   agentBrowserOpen,
   agentBrowserOpenArgv,
@@ -79,6 +89,9 @@ import {
   type AgentBrowserDeps,
 } from '../../src/main/ipc-handlers';
 import { SessionRegistry } from '../../src/main/agent-browser-session';
+import { ensureStartedSession } from '../../src/main/agent-browser-runtime';
+import { AgentBrowserViewer } from '../../src/main/agent-browser-viewer';
+import { IPC_CHANNELS } from '../../src/shared/types';
 
 // ─── renderer: engine lookup ───────────────────────────────────────────────
 
@@ -299,7 +312,135 @@ describe('enableAgentBrowser', () => {
   });
 });
 
+describe('browser sender ownership', () => {
+  function owner(engine = 'agent') {
+    const frame = {};
+    const sender = { id: 10, mainFrame: frame, isDestroyed: () => false,
+      executeJavaScript: vi.fn(async () => engine) };
+    const win = { webContents: sender, isDestroyed: () => false };
+    const manager = { idForWebContents: () => 'win-owned', getWindow: () => win };
+    return { event: { sender, senderFrame: frame }, manager, sender, win };
+  }
+
+  it('accepts only a live Agent surface in the sending desktop window', async () => {
+    const h = owner();
+    await expect(authorizeAgentBrowserSurface(h.event as any, h.manager as any, SURF)).resolves.toBeUndefined();
+    const other = owner('web');
+    await expect(authorizeAgentBrowserSurface(other.event as any, other.manager as any, SURF)).rejects.toThrow('Unauthorized');
+  });
+
+  it('dispatches authorized viewer actions before later input without another async owner lookup', async () => {
+    const h = owner();
+    const other = owner();
+    other.sender.id = 99;
+    Object.assign(h.sender, { once: vi.fn() });
+    const manager = {
+      idForWebContents: (wc: unknown) => wc === h.sender ? 'win-first' : wc === other.sender ? 'win-other' : undefined,
+      getWindow: (id: string) => id === 'win-first' ? h.win : other.win,
+    };
+    const order: string[] = [];
+    const attach = vi.spyOn(AgentBrowserViewer.prototype, 'attachAuthorized').mockImplementation(async (_id, _owner, _token, authorize) => { await authorize(); });
+    const action = vi.spyOn(AgentBrowserViewer.prototype, 'action').mockImplementation(async () => { order.push('paste'); });
+    const input = vi.spyOn(AgentBrowserViewer.prototype, 'input').mockImplementation(() => { order.push('input'); });
+    try {
+      registerIpcHandlers(manager as any);
+      await registeredIpc.handles.get(IPC_CHANNELS.AGENT_VIEWER_ATTACH)!(h.event, SURF, 'token');
+      h.sender.executeJavaScript.mockClear();
+      const paste = registeredIpc.handles.get(IPC_CHANNELS.AGENT_VIEWER_ACTION)!(h.event, SURF, 'token', 1, { type: 'paste' });
+      registeredIpc.events.get(IPC_CHANNELS.AGENT_VIEWER_INPUT)!(h.event, SURF, 'token', 1, {});
+      expect(order).toEqual(['paste', 'input']);
+      expect(h.sender.executeJavaScript).not.toHaveBeenCalled();
+      await paste;
+      expect(() => registeredIpc.handles.get(IPC_CHANNELS.AGENT_VIEWER_ACTION)!(other.event, SURF, 'token', 1, { type: 'paste' })).toThrow('Unauthorized');
+      registeredIpc.events.get(IPC_CHANNELS.AGENT_VIEWER_INPUT)!(other.event, SURF, 'token', 1, {});
+      expect(order).toEqual(['paste', 'input']);
+    } finally { attach.mockRestore(); action.mockRestore(); input.mockRestore(); }
+  });
+
+  it('rejects guests, subframes, malformed IDs, and destroyed desktops before a renderer lookup', async () => {
+    for (const mode of ['guest', 'subframe', 'invalid', 'destroyed']) {
+      const h = owner();
+      if (mode === 'guest') h.win.webContents = {} as any;
+      if (mode === 'subframe') h.event.senderFrame = {};
+      if (mode === 'destroyed') h.sender.isDestroyed = () => true;
+      await expect(authorizeAgentBrowserSurface(h.event as any, h.manager as any,
+        mode === 'invalid' ? '--bad' : SURF)).rejects.toThrow('Unauthorized');
+      expect(h.sender.executeJavaScript).not.toHaveBeenCalled();
+    }
+  });
+});
+
+describe('enable readiness', () => {
+  it('does not wait for an optional dashboard availability attempt', async () => {
+    const h = harness({ acquireDashboard: () => new Promise(() => {}) });
+    expect((await enableAgentBrowser(SURF, undefined, h.deps)).installed).toBe(true);
+    expect(h.calls).toHaveLength(1);
+  });
+
+  it('never reports a failed startup command as an enabled page', async () => {
+    const h = harness({}, async () => ({ ok: false, spawnFailed: false, data: null, stdout: '', stderr: 'Chrome failed' }));
+    await expect(enableAgentBrowser(SURF, undefined, h.deps)).rejects.toThrow('Chrome failed');
+  });
+});
+
 describe('disableAgentBrowser', () => {
+  it.each([false, true])('fences renewal behind the complete readback/close, including a renewed disable: %s', async (cancelRenewal) => {
+    let finishRead!: (result: any) => void;
+    let finishClose!: (result: any) => void;
+    const h = harness({}, async (_binary, argv) => {
+      if (argv.includes('url')) return new Promise((resolve) => { finishRead = resolve; });
+      if (argv.includes('close')) return new Promise((resolve) => { finishClose = resolve; });
+      return okRun();
+    });
+    await ensureStartedSession(SURF, 'https://old.test/', h.deps);
+    const disabling = disableAgentBrowser(SURF, h.deps);
+    const renewed = ensureStartedSession(SURF, 'https://new.test/', h.deps);
+    const cancelled = renewed.then(() => false, () => true);
+    const secondDisable = cancelRenewal ? disableAgentBrowser(SURF, h.deps) : undefined;
+    await vi.waitFor(() => expect(finishRead).toBeTypeOf('function'));
+    expect(h.calls.filter((argv) => argv.includes('open'))).toHaveLength(1);
+    finishRead(okRun({ url: 'https://old.test/' }));
+    await vi.waitFor(() => expect(finishClose).toBeTypeOf('function'));
+    expect(h.calls.filter((argv) => argv.includes('open'))).toHaveLength(1);
+    finishClose(okRun());
+    await disabling;
+    if (secondDisable) await secondDisable;
+    expect(await cancelled).toBe(cancelRenewal);
+    const commands = h.calls.map((argv) => argv.includes('open') ? 'open' : argv.includes('url') ? 'get url' : 'close');
+    expect(commands).toEqual(cancelRenewal ? ['open', 'get url', 'close'] : ['open', 'get url', 'close', 'open']);
+    if (!cancelRenewal) {
+      const live = h.registry.get(SURF);
+      await ensureStartedSession(SURF, undefined, h.deps);
+      expect(h.registry.get(SURF)).toBe(live);
+      expect(h.calls).toHaveLength(4);
+    }
+  });
+
+  it('waits for cancellation close and never launches a URL readback against that closed startup', async () => {
+    let finishOpen!: (result: any) => void;
+    let finishClose!: (result: any) => void;
+    let opens = 0;
+    const h = harness({}, async (_binary, argv) => {
+      if (argv.includes('open') && opens++ === 0) return new Promise((resolve) => { finishOpen = resolve; });
+      if (argv.includes('close')) return new Promise((resolve) => { finishClose = resolve; });
+      return okRun();
+    });
+    const old = ensureStartedSession(SURF, 'https://old.test/', h.deps);
+    const oldCancelled = old.then(() => false, () => true);
+    await vi.waitFor(() => expect(finishOpen).toBeTypeOf('function'));
+    const disabling = disableAgentBrowser(SURF, h.deps);
+    const renewed = ensureStartedSession(SURF, 'https://new.test/', h.deps);
+    finishOpen(okRun());
+    await vi.waitFor(() => expect(finishClose).toBeTypeOf('function'));
+    expect(h.calls.map((argv) => argv.includes('open') ? 'open' : argv.at(-1))).toEqual(['open', 'close']);
+    finishClose(okRun());
+    await disabling;
+    expect(await oldCancelled).toBe(true);
+    await renewed;
+    expect(h.calls.map((argv) => argv.includes('open') ? 'open' : argv.at(-1))).toEqual(['open', 'close', 'open']);
+    expect(h.calls.some((argv) => argv.includes('url'))).toBe(false);
+  });
+
   // The renderer calls this on unmount, which fires for panes that never
   // entered agent mode. A phantom release would decrement a refcount this
   // surface never incremented.

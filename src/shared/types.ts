@@ -35,6 +35,47 @@ export type SurfaceType = 'terminal' | 'browser' | 'markdown' | 'diff' | 'code' 
  */
 export type BrowserEngine = 'web' | 'agent';
 
+export interface AgentBrowserTab {
+  tabId: string;
+  title: string;
+  url: string;
+  active: boolean;
+}
+
+export type AgentViewerInput =
+  | { type: 'input_mouse'; eventType: 'mouseMoved' | 'mousePressed' | 'mouseReleased' | 'mouseWheel';
+      x: number; y: number; button: 'none' | 'left' | 'middle' | 'right'; clickCount: number;
+      modifiers: number; deltaX?: number; deltaY?: number }
+  | { type: 'input_keyboard'; eventType: 'keyDown' | 'rawKeyDown' | 'keyUp' | 'char'; key?: string; code?: string;
+      text?: string; windowsVirtualKeyCode: number; modifiers: number };
+
+export type AgentViewerAction =
+  | { type: 'viewport'; width: number; height: number }
+  | { type: 'copy' | 'paste' };
+
+export type AgentViewerMessage =
+  | { type: 'frame'; id: number; data: string; width: number; height: number }
+  | { type: 'status'; connected: boolean; width: number; height: number }
+  | { type: 'tabs'; tabs: AgentBrowserTab[] }
+  | { type: 'url'; url: string }
+  | { type: 'error'; message: string };
+
+export interface AgentViewerEvent {
+  surfaceId: string;
+  token: string;
+  revision: number;
+  message: AgentViewerMessage;
+}
+
+export interface AgentViewerBridge {
+  attach: (surfaceId: string, token: string) => Promise<void>;
+  detach: (surfaceId: string, token: string) => void;
+  ack: (surfaceId: string, token: string, id: number, drawn: boolean) => void;
+  input: (surfaceId: string, token: string, revision: number, input: AgentViewerInput) => void;
+  action: (surfaceId: string, token: string, revision: number, action: AgentViewerAction) => Promise<void>;
+  onEvent: (callback: (event: AgentViewerEvent) => void) => () => void;
+}
+
 export interface WorktreeMetadata {
   repoRoot: string;      // the MAIN checkout, not this one
   branch: string;
@@ -884,6 +925,12 @@ export const IPC_CHANNELS = {
   AGENT_BROWSER_INSTALL: 'agent-browser:install',
   AGENT_BROWSER_CURRENT_URL: 'agent-browser:current-url',
   AGENT_BROWSER_OPEN: 'agent-browser:open',
+  AGENT_VIEWER_ATTACH: 'agent-viewer:attach',
+  AGENT_VIEWER_DETACH: 'agent-viewer:detach',
+  AGENT_VIEWER_ACK: 'agent-viewer:ack',
+  AGENT_VIEWER_INPUT: 'agent-viewer:input',
+  AGENT_VIEWER_ACTION: 'agent-viewer:action',
+  AGENT_VIEWER_EVENT: 'agent-viewer:event',
   /**
    * The back/forward stack of a browser pane's webview, read so it can be
    * persisted (#315). Takes the guest's webContentsId and answers only for a

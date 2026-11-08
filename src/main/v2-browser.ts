@@ -23,7 +23,7 @@ import * as fs from 'fs';
 import { BrowserWindow } from 'electron';
 import { cdpBridge } from './ipc-handlers';
 import { agentBrowserPath, runAgentBrowser, unwrapAgentData, type RunResult } from './agent-browser-cli';
-import { acquireDashboardFor, sessionRegistry } from './agent-browser-runtime';
+import { acquireDashboardFor, ensureStartedSession, withDeadline } from './agent-browser-runtime';
 import type { AgentSession } from './agent-browser-session';
 import { toAgentBrowserArgv } from './agent-browser-verbs';
 import { keepRenderingLeases } from './browser-keep-rendering';
@@ -222,13 +222,13 @@ async function engineForSurface(surfaceId: string): Promise<BrowserEngine> {
  * calling `loadURL` and shows a distinct no-dashboard card, so the interstitial
  * is never painted. This log is the main-side half of the same story.
  */
-function agentTargetFor(surfaceId: string): BrowserTarget {
+async function agentTargetFor(surfaceId: string): Promise<BrowserTarget> {
   // Deliberately NOT awaited — see above. `.catch` is what keeps an unawaited
   // rejection from surfacing as an unhandled promise rejection.
   acquireDashboardFor(surfaceId).catch((err: Error) => {
     console.warn('[wmux] agent-browser dashboard did not start:', err?.message);
   });
-  return { kind: 'agent', session: sessionRegistry.ensure(surfaceId as SurfaceId) };
+  return { kind: 'agent', session: await ensureStartedSession(surfaceId as SurfaceId) };
 }
 
 /**
@@ -251,6 +251,18 @@ function agentTargetFor(surfaceId: string): BrowserTarget {
  * missing wcId as "my browser died" and dropping a live #62 binding.
  */
 export async function resolveBrowserTarget(caller?: string): Promise<BrowserTarget | null> {
+  // The public CLI budgets already reserve 5s for readiness. Shared UI startup
+  // may continue after this request gives up, but its requested verb must not.
+  const outcome = await withDeadline<{ target: BrowserTarget | null } | { error: unknown }>(
+    resolveBrowserTargetWithinBudget(caller).then((target) => ({ target }), (error: unknown) => ({ error })),
+    5000,
+    { error: new Error('Browser readiness timed out after 5s. The session may still be starting; retry the command once the page is ready.') },
+  );
+  if ('error' in outcome) throw outcome.error;
+  return outcome.target;
+}
+
+async function resolveBrowserTargetWithinBudget(caller?: string): Promise<BrowserTarget | null> {
   const bound = caller ? callerBrowserSurface.get(caller) : undefined;
   if (bound && (await engineForSurface(bound)) === 'agent') return agentTargetFor(bound);
 
