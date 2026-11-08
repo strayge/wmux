@@ -908,6 +908,9 @@ export const en = {
   'browser.agent.showDashboard': 'Show dashboard',
   'browser.agent.returnToPage': 'Return to page',
   'browser.agent.dismissError': 'Dismiss',
+  'browser.agent.reconnect': 'Reconnect / Continue',
+  'browser.agent.startNew': 'Start new session',
+  'browser.agent.starting': 'Starting browser session…',
   'browser.blank.title': 'No page open',
   'browser.blank.hint': 'Type a URL above, or set a start page in Settings → Browser.',
   // The browser panel's right-click menu (#439). Chrome's wording, so the

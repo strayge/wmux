@@ -35,6 +35,21 @@ import type { PaneId, SurfaceId, WorkspaceId, SurfaceRef, SplitNode } from '../.
 // redirected: `PtyLedger.takeOver()` runs at ipc-handlers import time and
 // REWRITES the ledger, which for an unmocked path is the live wmux's own.
 
+const streamSockets = vi.hoisted(() => ({
+  created: [] as Array<import('node:events').EventEmitter & { terminate: ReturnType<typeof vi.fn> }>,
+}));
+vi.mock('ws', async () => {
+  const { EventEmitter } = await import('node:events');
+  return { default: class extends EventEmitter {
+    static OPEN = 1;
+    readyState = 1;
+    bufferedAmount = 0;
+    send = vi.fn();
+    terminate = vi.fn();
+    constructor() { super(); streamSockets.created.push(this); }
+  } };
+});
+
 const registeredIpc = vi.hoisted(() => ({
   handles: new Map<string, Function>(),
   events: new Map<string, Function>(),
@@ -90,6 +105,8 @@ import {
 } from '../../src/main/ipc-handlers';
 import { SessionRegistry } from '../../src/main/agent-browser-session';
 import { ensureStartedSession } from '../../src/main/agent-browser-runtime';
+import * as runtime from '../../src/main/agent-browser-runtime';
+import * as agentCli from '../../src/main/agent-browser-cli';
 import { AgentBrowserViewer } from '../../src/main/agent-browser-viewer';
 import { IPC_CHANNELS } from '../../src/shared/types';
 
@@ -357,6 +374,102 @@ describe('browser sender ownership', () => {
     } finally { attach.mockRestore(); action.mockRestore(); input.mockRestore(); }
   });
 
+  it('reauthorizes reconnect before recovery, rejecting wrong windows, engine changes and subframes', async () => {
+    const h = owner();
+    Object.assign(h.sender, { once: vi.fn() });
+    const attach = vi.spyOn(AgentBrowserViewer.prototype, 'attachAuthorized').mockImplementation(async (_id, _owner, _token, authorize) => { await authorize(); });
+    try {
+      registerIpcHandlers(h.manager as any);
+      await registeredIpc.handles.get(IPC_CHANNELS.AGENT_VIEWER_ATTACH)!(h.event, SURF, 'old');
+      const handler = registeredIpc.handles.get(IPC_CHANNELS.AGENT_VIEWER_RECONNECT)!;
+      await handler(h.event, SURF, 'old', 'new');
+      expect(attach).toHaveBeenLastCalledWith(SURF, 10, 'new', expect.any(Function), expect.any(Function), 'old');
+      const calls = attach.mock.calls.length;
+      await expect(handler({ ...h.event, senderFrame: {} }, SURF, 'old', 'newer')).rejects.toThrow('Unauthorized');
+      expect(attach).toHaveBeenCalledTimes(calls);
+      h.sender.executeJavaScript.mockResolvedValue('web');
+      await expect(handler(h.event, SURF, 'old', 'newer')).rejects.toThrow('Unauthorized');
+    } finally { attach.mockRestore(); }
+  });
+
+  it.each([false, true])('uses the real disable handler without launch-capable readback after observed loss: %s', async (lost) => {
+    const id = 'surf-handler-loss' as SurfaceId;
+    const h = owner();
+    Object.assign(h.sender, { once: vi.fn(), send: vi.fn() });
+    const binary = vi.spyOn(agentCli, 'agentBrowserPath').mockReturnValue('native.exe');
+    const native = vi.spyOn(agentCli, 'runAgentBrowser').mockResolvedValue(okRun({ url: 'https://available.test/' }));
+    const allocate = vi.spyOn(runtime.sessionRegistry, 'ensureBindable');
+    try {
+      await ensureStartedSession(id, undefined, {
+        binary: () => 'native.exe', ensureSession: (id) => runtime.sessionRegistry.ensure(id),
+        getSession: (id) => runtime.sessionRegistry.get(id), run: async () => okRun(),
+      });
+      registerIpcHandlers(h.manager as any);
+      await registeredIpc.handles.get(IPC_CHANNELS.AGENT_VIEWER_ATTACH)!(h.event, id, 'owned');
+      const socket = streamSockets.created.at(-1)!;
+      const sessionName = runtime.sessionRegistry.get(id)!.sessionName;
+      if (lost) socket.emit('message', JSON.stringify({ type: 'status', connected: false, viewportWidth: 900, viewportHeight: 640 }));
+      h.sender.executeJavaScript.mockResolvedValue('web');
+      const result = await registeredIpc.handles.get(IPC_CHANNELS.AGENT_BROWSER_DISABLE)!(h.event, id);
+      expect(result).toEqual(lost ? {} : { url: 'https://available.test/' });
+      expect(native.mock.calls.map((call) => call[1])).toEqual(lost
+        ? [['--session', sessionName, 'close']]
+        : [['--session', sessionName, '--json', 'get', 'url'], ['--session', sessionName, 'close']]);
+      expect(allocate).not.toHaveBeenCalled();
+      expect(runtime.sessionRegistry.get(id)).toBeUndefined();
+      expect(runtime.getStartedSession(id)).toBeUndefined();
+      expect(socket.terminate).toHaveBeenCalledOnce();
+      expect(socket.listenerCount('message')).toBe(0);
+    } finally {
+      await registeredIpc.handles.get(IPC_CHANNELS.AGENT_BROWSER_DISABLE)!(h.event, id).catch(() => {});
+      runtime.releaseAgentSession(id);
+      allocate.mockRestore(); native.mockRestore(); binary.mockRestore();
+    }
+  });
+
+  it('keeps a failed fresh-close gate across reused enable/open/read/reconnect paths until explicit close succeeds', async () => {
+    const id = 'surf-handler-restart' as SurfaceId;
+    const h = owner();
+    Object.assign(h.sender, { once: vi.fn(), send: vi.fn() });
+    const binary = vi.spyOn(agentCli, 'agentBrowserPath').mockReturnValue('native.exe');
+    const native = vi.spyOn(agentCli, 'runAgentBrowser').mockResolvedValue(okRun());
+    const acquire = vi.spyOn(runtime, 'acquireDashboardFor').mockResolvedValue();
+    const allocate = vi.spyOn(runtime.sessionRegistry, 'ensureBindable').mockImplementation(async (id) => runtime.sessionRegistry.ensure(id));
+    try {
+      await ensureStartedSession(id, undefined, {
+        binary: () => 'native.exe', ensureSession: (id) => runtime.sessionRegistry.ensure(id),
+        getSession: (id) => runtime.sessionRegistry.get(id), run: async () => okRun(),
+      });
+      registerIpcHandlers(h.manager as any);
+      const handler = (channel: string) => registeredIpc.handles.get(channel)!;
+      await handler(IPC_CHANNELS.AGENT_VIEWER_ATTACH)(h.event, id, 'owned');
+      const original = runtime.sessionRegistry.get(id);
+      native.mockResolvedValueOnce({ ...okRun(), ok: false, stderr: 'Close failed' });
+      await expect(handler(IPC_CHANNELS.AGENT_BROWSER_DISABLE)(h.event, id, true)).rejects.toThrow('Close failed');
+      expect(runtime.sessionRegistry.get(id)).toBe(original);
+      expect(runtime.getStartedSession(id)).toBeUndefined();
+      await expect(handler(IPC_CHANNELS.AGENT_BROWSER_DISABLE)({ ...h.event, senderFrame: {} }, id, true)).rejects.toThrow('Unauthorized');
+      await expect(handler(IPC_CHANNELS.AGENT_BROWSER_ENABLE)(h.event, id, 'https://old.test/')).rejects.toThrow('paused');
+      expect(await handler(IPC_CHANNELS.AGENT_BROWSER_OPEN)(h.event, id, 'https://old.test/')).toEqual({ ok: false });
+      expect(await handler(IPC_CHANNELS.AGENT_BROWSER_CURRENT_URL)(h.event, id)).toEqual({});
+      await expect(handler(IPC_CHANNELS.AGENT_VIEWER_RECONNECT)(h.event, id, 'owned', 'recovery')).rejects.toThrow('Stale');
+      expect(handler(IPC_CHANNELS.AGENT_BROWSER_STATUS)(h.event).installed).toBe(true);
+      expect(native).toHaveBeenCalledOnce();
+      expect(allocate).not.toHaveBeenCalled();
+      await handler(IPC_CHANNELS.AGENT_BROWSER_DISABLE)(h.event, id, true);
+      await handler(IPC_CHANNELS.AGENT_BROWSER_ENABLE)(h.event, id, 'about:blank');
+      expect(native.mock.calls.map((call) => call[1])).toEqual([
+        ['--session', original!.sessionName, 'close'], ['--session', original!.sessionName, 'close'],
+        ['--session', original!.sessionName, '--pin-tab', 'open'],
+      ]);
+      expect(runtime.getStartedSession(id)).toBeDefined();
+    } finally {
+      await registeredIpc.handles.get(IPC_CHANNELS.AGENT_BROWSER_DISABLE)!(h.event, id).catch(() => {});
+      runtime.releaseAgentSession(id);
+      allocate.mockRestore(); acquire.mockRestore(); native.mockRestore(); binary.mockRestore();
+    }
+  });
+
   it('rejects guests, subframes, malformed IDs, and destroyed desktops before a renderer lookup', async () => {
     for (const mode of ['guest', 'subframe', 'invalid', 'destroyed']) {
       const h = owner();
@@ -444,6 +557,27 @@ describe('disableAgentBrowser', () => {
   // The renderer calls this on unmount, which fires for panes that never
   // entered agent mode. A phantom release would decrement a refcount this
   // surface never incremented.
+  it('reports a cancelled startup close failure instead of silently declaring a fresh start safe', async () => {
+    let finishOpen!: (result: any) => void;
+    let closes = 0;
+    const h = harness({}, async (_binary, argv) => {
+      if (argv.includes('open') && !finishOpen) return new Promise((resolve) => { finishOpen = resolve; });
+      if (argv.includes('close') && closes++ === 0) return { ...okRun(), ok: false, stderr: 'Cancelled close failed' };
+      return okRun();
+    });
+    const startup = ensureStartedSession(SURF, undefined, h.deps).catch((err) => err);
+    await vi.waitFor(() => expect(finishOpen).toBeTypeOf('function'));
+    const disabling = disableAgentBrowser(SURF, h.deps, true);
+    finishOpen(okRun());
+    await expect(disabling).rejects.toThrow('Cancelled close failed');
+    expect(await startup).toBeInstanceOf(Error);
+    expect(h.calls.map((argv) => argv.at(-1))).toEqual(['open', 'close']);
+    expect(h.registry.get(SURF)).toBeDefined();
+    await disableAgentBrowser(SURF, h.deps, true);
+    await ensureStartedSession(SURF, 'about:blank', h.deps);
+    expect(h.calls.map((argv) => argv.at(-1))).toEqual(['open', 'close', 'close', 'open']);
+  });
+
   it('is a no-op for a surface with no session', async () => {
     const h = harness();
     expect(await disableAgentBrowser(SURF, h.deps)).toEqual({});
@@ -462,11 +596,51 @@ describe('disableAgentBrowser', () => {
 
     expect(res).toEqual({ url: 'https://example.com/deep' });
     expect(h.calls).toEqual([
-      ['--session', session.sessionName, 'get', 'url'],
+      ['--session', session.sessionName, '--json', 'get', 'url'],
       ['--session', session.sessionName, 'close'],
     ]);
     expect(h.registry.get(SURF)).toBeUndefined();
     expect(h.released).toEqual([SURF]);
+  });
+
+  it.each(['launched', 'relaunchedBrowser', 'restartedBackground'])('does not chain teardown close after readback observes lifecycle.%s', async (flag) => {
+    const h = harness({}, async (_binary, argv) => argv.includes('url')
+      ? okRun({ success: true, data: { lifecycle: { [flag]: true }, url: 'about:blank' } }) : okRun());
+    await enableAgentBrowser(SURF, undefined, h.deps);
+    h.calls.length = 0;
+    await disableAgentBrowser(SURF, h.deps);
+    expect(h.calls).toHaveLength(1);
+    expect(h.calls[0]).toContain('--json');
+    expect(h.calls[0]).toContain('url');
+    expect(h.registry.get(SURF)).toBeUndefined();
+    expect(h.released).toEqual([SURF]);
+  });
+
+  it('requires successful explicit close before fresh startup, retaining the close target for retry and skipping URL readback', async () => {
+    const h = harness();
+    await enableAgentBrowser(SURF, undefined, h.deps);
+    const session = h.registry.get(SURF);
+    const run = vi.fn().mockResolvedValueOnce({ ok: false, stderr: 'Close failed', data: null }).mockResolvedValueOnce(okRun());
+    const deps = { ...h.deps, run };
+    await expect(disableAgentBrowser(SURF, deps, true)).rejects.toThrow('Close failed');
+    expect(h.registry.get(SURF)).toBe(session);
+    expect(h.released).toEqual([]);
+    await disableAgentBrowser(SURF, deps, true);
+    expect(run.mock.calls.map((call) => call[1])).toEqual([
+      ['--session', session!.sessionName, 'close'], ['--session', session!.sessionName, 'close'],
+    ]);
+    expect(h.registry.get(SURF)).toBeUndefined();
+    expect(h.released).toEqual([SURF]);
+  });
+
+  it('reports a missing close binary on explicit fresh-start instead of declaring success', async () => {
+    const h = harness();
+    await enableAgentBrowser(SURF, undefined, h.deps);
+    h.deps.binary = () => null;
+    await expect(disableAgentBrowser(SURF, h.deps, true)).rejects.toThrow('could not be closed');
+    expect(h.registry.get(SURF)).toBeDefined();
+    expect(h.released).toEqual([]);
+    await disableAgentBrowser(SURF, h.deps);
   });
 
   it('still closes when the read-back fails', async () => {

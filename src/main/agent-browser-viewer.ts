@@ -5,7 +5,7 @@
  */
 import WebSocket from 'ws';
 import type { AgentSession } from './agent-browser-session';
-import { agentBrowserPath, runAgentBrowser, unwrapAgentData, type RunResult } from './agent-browser-cli';
+import { agentBrowserPath, runAgentBrowser, unwrapAgentData, observedBrowserReplacement, type RunResult } from './agent-browser-cli';
 import { getStartedSession } from './agent-browser-runtime';
 import type { AgentBrowserTab, AgentViewerAction, AgentViewerEvent, AgentViewerInput, AgentViewerMessage, SurfaceId } from '../shared/types';
 
@@ -92,22 +92,41 @@ const COPY_SELECTION = `(() => { const e = document.activeElement;
 
 export class AgentBrowserViewer {
   private subscriptions = new Map<SurfaceId, Subscription>();
-  private paused = new Map<SurfaceId, string>();
+  private paused = new Map<SurfaceId, { message: string; restart?: boolean }>();
   private attaching = new Map<string, { surfaceId: SurfaceId; owner: number; token: string }>();
+  // A paused subscription has no socket, but recovery must still prove its owner/token.
+  private leases = new Map<SurfaceId, { owner: number; token: string }>();
 
   constructor(private deps: ViewerDeps) {}
 
   /** Record intent before async authorization so detach can fence a not-yet-created socket. */
   async attachAuthorized(surfaceId: SurfaceId, owner: number, token: string,
-    authorize: () => Promise<void>, emit: Subscription['emit']): Promise<void> {
+    authorize: () => Promise<void>, emit: Subscription['emit'], previousToken?: string): Promise<void> {
     if (typeof token !== 'string' || !/^[A-Za-z0-9-]{1,128}$/.test(token)) throw new Error('Invalid viewer subscription');
     const key = `${owner}:${surfaceId}`;
+    const lease = this.leases.get(surfaceId);
+    const recoverySession = previousToken !== undefined ? this.deps.session(surfaceId) : undefined;
+    const failure = this.paused.get(surfaceId);
+    if (previousToken !== undefined && (!lease || lease.owner !== owner || lease.token !== previousToken || token === previousToken)) {
+      throw new Error('Stale viewer recovery');
+    }
     const intent = { surfaceId, owner, token };
     this.attaching.set(key, intent);
     try {
       await authorize();
       if (this.attaching.get(key) !== intent) return;
-      this.attach(surfaceId, owner, token, emit);
+      if (previousToken !== undefined) {
+        if (this.leases.get(surfaceId) !== lease || this.paused.get(surfaceId) !== failure
+          || this.deps.session(surfaceId) !== recoverySession) throw new Error('Stale viewer recovery');
+        if (failure?.restart) throw new Error(failure.message);
+        if (!recoverySession) throw new Error('Browser session is unavailable. Start a new session.');
+        this.paused.delete(surfaceId);
+      }
+      try { this.attach(surfaceId, owner, token, emit); }
+      catch (err) {
+        if (previousToken !== undefined && this.leases.get(surfaceId)?.token === token) this.leases.set(surfaceId, lease!);
+        throw err;
+      }
     } finally {
       if (this.attaching.get(key) === intent) this.attaching.delete(key);
     }
@@ -115,15 +134,21 @@ export class AgentBrowserViewer {
 
   attach(surfaceId: SurfaceId, owner: number, token: string, emit: Subscription['emit']): void {
     if (typeof token !== 'string' || !/^[A-Za-z0-9-]{1,128}$/.test(token)) throw new Error('Invalid viewer subscription');
-    const existing = this.subscriptions.get(surfaceId);
+    const existing = this.leases.get(surfaceId);
     if (existing && existing.owner !== owner) throw new Error('Unauthorized browser owner');
     this.attaching.delete(`${owner}:${surfaceId}`);
     const session = this.deps.session(surfaceId);
     if (!session) throw new Error('Browser session is not enabled');
     this.dispose(surfaceId);
+    this.leases.set(surfaceId, { owner, token });
     const failure = this.paused.get(surfaceId);
-    if (failure) throw new Error(failure);
-    const socket = this.deps.connect(`ws://127.0.0.1:${session.streamPort}/?pacing=ack&maxFps=30`);
+    if (failure) throw new Error(failure.message);
+    let socket: WebSocket;
+    try { socket = this.deps.connect(`ws://127.0.0.1:${session.streamPort}/?pacing=ack&maxFps=30`); }
+    catch (err) {
+      this.paused.set(surfaceId, { message: 'Page stream connection failed.' });
+      throw err;
+    }
     const sub: Subscription = { surfaceId, owner, token, session, socket, emit, revision: 0,
       ready: false, tabs: [], visible: true, workRevision: 0, nextFrame: 0, queue: Promise.resolve(), queued: 0 };
     this.subscriptions.set(surfaceId, sub);
@@ -137,7 +162,12 @@ export class AgentBrowserViewer {
   }
 
   private current(sub: Subscription): boolean {
-    return this.subscriptions.get(sub.surfaceId) === sub && this.deps.session(sub.surfaceId) === sub.session;
+    if (this.subscriptions.get(sub.surfaceId) !== sub) return false;
+    if (this.deps.session(sub.surfaceId) !== sub.session) {
+      this.fail(sub, 'The browser session changed or became unavailable. Reconnect to continue.');
+      return false;
+    }
+    return true;
   }
 
   private send(sub: Subscription, message: AgentViewerMessage): void {
@@ -145,13 +175,30 @@ export class AgentBrowserViewer {
   }
 
   private fail(sub: Subscription, message: string): void {
-    if (!this.current(sub)) return;
+    if (this.subscriptions.get(sub.surfaceId) !== sub) return;
     sub.ready = false;
+    sub.workRevision++;
     sub.pending = undefined;
     sub.revision++;
-    this.paused.set(sub.surfaceId, message);
-    this.send(sub, { type: 'error', message });
+    this.paused.set(sub.surfaceId, { message });
+    sub.emit({ surfaceId: sub.surfaceId, token: sub.token, revision: sub.revision, message: { type: 'error', message } });
     this.dispose(sub.surfaceId);
+  }
+
+  /** Late results may reveal replacement, but can never pause a newer subscription. */
+  private checkNativeResult(sub: Subscription, result: RunResult): void {
+    if (!this.current(sub)) throw new Error('Tabs changed or page action became stale.');
+    if (observedBrowserReplacement(result)) {
+      this.fail(sub, 'The native command started or replaced the browser. Reconnect to continue; the action was not retried.');
+      throw new Error('Browser session changed. Reconnect to continue.');
+    }
+  }
+
+  reportFailure(id: SurfaceId, owner: number, token: string, revision: number, failure: unknown): void {
+    const sub = this.owned(id, owner, token);
+    if (sub && sub.revision === revision && failure === 'decode') {
+      this.fail(sub, 'Could not decode the page stream. Open dashboard or reconnect to continue.');
+    }
   }
 
   private receive(sub: Subscription, v: Record<string, any>): void {
@@ -328,10 +375,11 @@ export class AgentBrowserViewer {
       let res: RunResult;
       try { res = await this.deps.run(sub.session, argv); }
       catch (err) {
-        if (this.current(sub) && sub.revision === revision && sub.workRevision === workRevision) this.fail(sub, 'Native page action could not be launched.');
+        this.fail(sub, 'Native page action could not be launched.');
         throw err;
       }
-      if (!this.current(sub) || sub.revision !== revision || sub.workRevision !== workRevision) throw new Error('Stale page action');
+      this.checkNativeResult(sub, res);
+      if (sub.revision !== revision || sub.workRevision !== workRevision) throw new Error('Stale page action');
       if (!res.ok) {
         const message = res.stderr.trim() || 'Native page action failed.';
         // A history boundary or rejected navigation is not evidence of browser loss.
@@ -370,7 +418,10 @@ export class AgentBrowserViewer {
     };
     const run = async (argv: string[]) => {
       check();
-      const result = await this.deps.run(sub.session, argv);
+      let result: RunResult;
+      try { result = await this.deps.run(sub.session, argv); }
+      catch (err) { this.fail(sub, 'Native tab action could not be launched.'); throw err; }
+      this.checkNativeResult(sub, result);
       check();
       if (!result.ok) throw new Error(result.stderr.trim() || 'Native tab action failed.');
       return result;
@@ -412,10 +463,30 @@ export class AgentBrowserViewer {
   detach(id: SurfaceId, owner: number, token: string): void {
     const key = `${owner}:${id}`;
     if (this.attaching.get(key)?.token === token) this.attaching.delete(key);
-    if (this.owned(id, owner, token)) this.dispose(id);
+    const lease = this.leases.get(id);
+    if (lease?.owner === owner && lease.token === token) {
+      this.leases.delete(id);
+      this.dispose(id);
+      // Recovery uses a new token while authorization is pending.
+      this.attaching.delete(key);
+    }
   }
 
   canAct(id: SurfaceId): boolean { return !this.paused.has(id); }
+
+  /** Dashboard enable may reuse a ready session, but cannot start through a failed close. */
+  canEnable(id: SurfaceId): boolean {
+    const pause = this.paused.get(id);
+    return !pause || (!pause.restart && !!this.deps.session(id));
+  }
+
+  /** Failed fresh-start closes stay blocked until that explicit close succeeds. */
+  pauseForRestart(id: SurfaceId): () => void {
+    this.forget(id);
+    const pause = { message: 'Close the previous browser session before starting a new one. Retry Start new session.', restart: true };
+    this.paused.set(id, pause);
+    return () => { if (this.paused.get(id) === pause) this.paused.delete(id); };
+  }
 
   /** Engine/surface teardown alone clears a paused session. */
   forget(id: SurfaceId): void {
@@ -423,6 +494,7 @@ export class AgentBrowserViewer {
       if (intent.surfaceId === id) this.attaching.delete(key);
     }
     this.dispose(id);
+    this.leases.delete(id);
     this.paused.delete(id);
   }
 
@@ -433,8 +505,11 @@ export class AgentBrowserViewer {
     sub.pending = undefined;
     sub.latest = undefined;
     sub.ready = false;
-    // Keep the error listener until close: terminating a connecting ws emits an error.
     sub.socket.removeAllListeners('message');
+    sub.socket.removeAllListeners('close');
+    sub.socket.removeAllListeners('error');
+    // Terminating a connecting ws emits an error; it must not revive this subscription.
+    sub.socket.once('error', () => {});
     sub.socket.terminate();
   }
 }

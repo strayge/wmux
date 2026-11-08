@@ -11,13 +11,13 @@ const tabs = [
 ];
 vi.mock('../../src/renderer/components/Browser/AgentBrowserViewer', () => ({
   default: function Viewer(props: { visible: boolean; ref: Ref<{ action: typeof viewerAction }>;
-    onPageState: (url: string, title: string) => void; onConnection: (connected: boolean) => void; onTabs: (tabs: unknown[]) => void }) {
+    onPageState: (url: string, title: string) => void; onConnection: (connected: boolean) => void; onTabs: (tabs: unknown[]) => void; onStartNew: () => void }) {
     useImperativeHandle(props.ref, () => ({ action: viewerAction }));
     useEffect(() => { props.onConnection(true); }, []);
-    return createElement('button', { 'data-viewer': String(props.visible), onClick: () => {
+    return createElement('div', {}, createElement('button', { 'data-viewer': String(props.visible), onClick: () => {
       props.onPageState('https://agent.test/next', 'Agent title');
       props.onTabs(tabs);
-    } }, 'fixture page');
+    } }, 'fixture page'), createElement('button', { onClick: props.onStartNew }, 'Start new session'));
   },
 }));
 
@@ -162,11 +162,99 @@ describe('Page presentation', () => {
     } finally { delete (HTMLElement.prototype as any).reload; }
   });
 
+  it('starts a deliberately fresh blank session via disable then enable, never the old streamed URL', async () => {
+    await render();
+    await click('fixture page');
+    api.disable.mockClear();
+    api.enable.mockClear();
+    await click('Start new session');
+    expect(api.disable).toHaveBeenCalledExactlyOnceWith('surf-pane', true);
+    expect(api.enable).toHaveBeenCalledExactlyOnceWith('surf-pane', 'about:blank');
+    expect(api.disable.mock.invocationCallOrder[0]).toBeLessThan(api.enable.mock.invocationCallOrder[0]);
+    expect(api.open).not.toHaveBeenCalled();
+  });
+
+  it('reports failed close and explicitly retries it before any new startup', async () => {
+    await render();
+    api.disable.mockRejectedValueOnce(new Error('Close timed out'));
+    await click('Start new session');
+    expect(container.querySelector('[data-viewer]')).toBeNull();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain('Close timed out');
+    expect(api.enable).toHaveBeenCalledOnce();
+    await click('Try again');
+    expect(api.disable).toHaveBeenCalledTimes(2);
+    expect(api.enable).toHaveBeenLastCalledWith('surf-pane', 'about:blank');
+  });
+
+  it('retries a failed fresh close from unavailable Dashboard before opening only a blank session', async () => {
+    api.status.mockResolvedValue({ installed: true, dashboardAvailable: false });
+    await render();
+    api.disable.mockRejectedValueOnce(new Error('Close failed'));
+    await click('Start new session');
+    await click('…');
+    await click('Show dashboard');
+    expect(container.textContent).toContain('The activity viewer did not start');
+    let finishClose!: () => void;
+    api.disable.mockImplementationOnce(() => new Promise<void>((resolve) => { finishClose = resolve; }));
+    await click('Try again');
+    expect(api.disable).toHaveBeenLastCalledWith('surf-pane', true);
+    expect(api.enable).toHaveBeenCalledOnce();
+    expect(container.textContent).toContain('Starting browser session');
+    await act(async () => finishClose());
+    expect(api.enable).toHaveBeenCalledTimes(2);
+    expect(api.enable).toHaveBeenLastCalledWith('surf-pane', 'about:blank');
+    expect(api.open).not.toHaveBeenCalled();
+  });
+
+  it('clears fresh-start retry intent after success so a later Dashboard retry does not close the healthy session', async () => {
+    api.status.mockResolvedValue({ installed: true, dashboardAvailable: false });
+    await render();
+    await click('Start new session');
+    expect(api.disable).toHaveBeenCalledOnce();
+    expect(api.enable).toHaveBeenCalledTimes(2);
+    await click('…');
+    await click('Show dashboard');
+    await click('Try again');
+    expect(api.disable).toHaveBeenCalledOnce();
+    expect(api.enable).toHaveBeenCalledTimes(3);
+    expect(api.open).not.toHaveBeenCalled();
+  });
+
+  it('does not renew startup after a pending fresh close completes after switching to Web', async () => {
+    await render();
+    let finish!: () => void;
+    api.disable.mockImplementationOnce(() => new Promise<void>((resolve) => { finish = resolve; }));
+    await click('Start new session');
+    await render({ engine: 'web' });
+    await act(async () => finish());
+    expect(api.enable).toHaveBeenCalledOnce();
+  });
+
+  it('offers setup for a missing binary and returns from unavailable Dashboard without a new session', async () => {
+    api.enable.mockResolvedValueOnce({ installed: false });
+    await render();
+    expect(container.textContent).toContain('Install');
+    expect(container.querySelector('[data-viewer]')).toBeNull();
+    await render({ engine: 'web' });
+    api.status.mockResolvedValue({ installed: true, dashboardAvailable: false });
+    await render();
+    await click('…');
+    await click('Show dashboard');
+    expect(container.textContent).toContain('The activity viewer did not start');
+    await click('…');
+    await click('Return to page');
+    expect(container.querySelector('[data-viewer="true"]')).toBeTruthy();
+    expect(api.enable).toHaveBeenCalledTimes(2);
+  });
+
   it('reports startup failure instead of presenting a ready page', async () => {
     api.enable.mockRejectedValue(new Error('Chrome startup failed'));
     await render();
     expect(container.querySelector('[data-viewer]')).toBeNull();
     expect(container.querySelector('[role="alert"]')?.textContent).toContain('Chrome startup failed');
+    api.enable.mockResolvedValueOnce({ installed: true });
+    await click('Try again');
+    expect(container.querySelector('[data-viewer="true"]')).toBeTruthy();
   });
 });
 

@@ -73,6 +73,8 @@ export interface AgentViewerEvent {
 
 export interface AgentViewerBridge {
   attach: (surfaceId: string, token: string) => Promise<void>;
+  reconnect: (surfaceId: string, previousToken: string, token: string) => Promise<void>;
+  reportFailure: (surfaceId: string, token: string, revision: number, failure: 'decode') => void;
   detach: (surfaceId: string, token: string) => void;
   ack: (surfaceId: string, token: string, id: number, drawn: boolean) => void;
   input: (surfaceId: string, token: string, revision: number, input: AgentViewerInput) => void;
@@ -930,6 +932,8 @@ export const IPC_CHANNELS = {
   AGENT_BROWSER_CURRENT_URL: 'agent-browser:current-url',
   AGENT_BROWSER_OPEN: 'agent-browser:open',
   AGENT_VIEWER_ATTACH: 'agent-viewer:attach',
+  AGENT_VIEWER_RECONNECT: 'agent-viewer:reconnect',
+  AGENT_VIEWER_FAILURE: 'agent-viewer:failure',
   AGENT_VIEWER_DETACH: 'agent-viewer:detach',
   AGENT_VIEWER_ACK: 'agent-viewer:ack',
   AGENT_VIEWER_INPUT: 'agent-viewer:input',

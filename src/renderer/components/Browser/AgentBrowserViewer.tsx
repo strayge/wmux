@@ -18,6 +18,7 @@ interface Props {
   onTabs?: (tabs: AgentBrowserTab[]) => void;
   onConnection?: (connected: boolean) => void;
   onDashboard?: () => void;
+  onStartNew?: () => void;
   ref?: Ref<AgentViewerHandle>;
 }
 
@@ -33,7 +34,7 @@ export function viewerModifiers(e: { altKey: boolean; ctrlKey: boolean; metaKey:
 }
 
 /** Textarea supplies a real IME target; committed composition is sent exactly once. */
-export default function AgentBrowserViewer({ surfaceId, visible, focused, onActivate, onPageState, onTabs, onConnection, onDashboard, ref }: Props) {
+export default function AgentBrowserViewer({ surfaceId, visible, focused, onActivate, onPageState, onTabs, onConnection, onDashboard, onStartNew, ref }: Props) {
   const t = useT();
   const area = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
@@ -48,6 +49,8 @@ export default function AgentBrowserViewer({ surfaceId, visible, focused, onActi
   const [error, setError] = useState('');
   const [connected, setConnected] = useState(false);
   const [hasFrame, setHasFrame] = useState(false);
+  const [recovering, setRecovering] = useState(false);
+  const reconnect = useRef<() => void>(() => {});
   const composing = useRef(false);
   const committedComposition = useRef<string | null>(null);
   const wheelHandler = useRef<(event: WheelEvent) => void>(() => {});
@@ -81,13 +84,16 @@ export default function AgentBrowserViewer({ surfaceId, visible, focused, onActi
 
   useEffect(() => {
     const api = window.wmux.agentViewer as AgentViewerBridge;
-    const token = crypto.randomUUID();
+    let token = crypto.randomUUID();
     state.current = { token, revision: 0, ready: false, drawnRevision: -1, width: 1, height: 1 };
     setError('');
     setConnected(false);
     callbacks.current.onConnection?.(false);
     setHasFrame(false);
     let disposed = false;
+    let failed = false;
+    let recoveryPending = false;
+    let recoveryFrom: string | undefined;
     let resizeTimer: ReturnType<typeof setTimeout> | undefined;
     let resizing = false;
     let pendingSize: { width: number; height: number; revision: number } | undefined;
@@ -140,8 +146,40 @@ export default function AgentBrowserViewer({ surfaceId, visible, focused, onActi
       if (shown) measure();
     };
     visibilityChanged.current = syncVisibility;
+    reconnect.current = () => {
+      if (disposed || recoveryPending) return;
+      recoveryPending = true;
+      setRecovering(true);
+      recoveryFrom = token;
+      const previousToken = token;
+      token = crypto.randomUUID();
+      state.current = { token, revision: 0, ready: false, drawnRevision: -1, width: 1, height: 1 };
+      failed = false;
+      visibilityGeneration.current++;
+      pendingSize = undefined;
+      lastSize = '';
+      activeTab = undefined;
+      setError('');
+      setHasFrame(false);
+      setConnected(false);
+      callbacks.current.onConnection?.(false);
+      // The stream's initial status/tabs/URL are authoritative; never issue a native read/open.
+      void api.reconnect(surfaceId, previousToken, token).then(() => {
+        if (!disposed && (!isVisible.current || document.hidden)) syncVisibility();
+      }).catch((err) => {
+        if (disposed) return;
+        token = previousToken;
+        state.current.token = token;
+        failed = true;
+        setError(String(err));
+      }).finally(() => {
+        recoveryPending = false;
+        recoveryFrom = undefined;
+        if (!disposed) setRecovering(false);
+      });
+    };
     const off = api.onEvent((event: AgentViewerEvent) => {
-      if (disposed || event.surfaceId !== surfaceId || event.token !== token) return;
+      if (disposed || failed || event.surfaceId !== surfaceId || event.token !== token || event.revision < state.current.revision) return;
       const { message } = event;
       if (state.current.revision !== event.revision) {
         state.current.drawnRevision = -1;
@@ -150,6 +188,7 @@ export default function AgentBrowserViewer({ surfaceId, visible, focused, onActi
       state.current.revision = event.revision;
       switch (message.type) {
         case 'error':
+          failed = true;
           state.current.ready = false;
           state.current.drawnRevision = -1;
           setHasFrame(false);
@@ -182,14 +221,15 @@ export default function AgentBrowserViewer({ surfaceId, visible, focused, onActi
             break;
           }
           const revision = event.revision;
+          const frameToken = token;
           const generation = visibilityGeneration.current;
           const image = new Image();
-          const finish = (drawn: boolean) => api.ack(surfaceId, token, message.id, drawn);
+          const finish = (drawn: boolean) => api.ack(surfaceId, frameToken, message.id, drawn);
           image.onload = () => {
             let drawn = false;
             try {
               const el = canvas.current;
-              if (!disposed && isVisible.current && !document.hidden && generation === visibilityGeneration.current && state.current.ready && state.current.revision === revision && el) {
+              if (!disposed && frameToken === token && isVisible.current && !document.hidden && generation === visibilityGeneration.current && state.current.ready && state.current.revision === revision && el) {
                 el.width = image.naturalWidth;
                 el.height = image.naturalHeight;
                 const context = el.getContext('2d');
@@ -202,17 +242,23 @@ export default function AgentBrowserViewer({ surfaceId, visible, focused, onActi
                   setHasFrame(true);
                 }
               }
-            } finally { finish(drawn); }
+            } catch { decodeFailure(); }
+            finally { finish(drawn); }
           };
-          image.onerror = () => {
-            if (!disposed && isVisible.current && generation === visibilityGeneration.current && state.current.revision === revision) {
+          const decodeFailure = () => {
+            if (!disposed && frameToken === token && !failed && isVisible.current && generation === visibilityGeneration.current && state.current.revision === revision) {
+              failed = true;
               state.current.ready = false;
+              state.current.drawnRevision = -1;
+              pendingSize = undefined;
+              setHasFrame(false);
               setConnected(false);
               callbacks.current.onConnection?.(false);
-              setError('Could not decode the page stream. Open Dashboard to continue.');
+              setError('Could not decode the page stream. Open dashboard or reconnect to continue.');
+              api.reportFailure(surfaceId, frameToken, revision, 'decode');
             }
-            finish(false);
           };
+          image.onerror = () => { decodeFailure(); finish(false); };
           image.src = `data:image/jpeg;base64,${message.data}`;
           break;
         }
@@ -231,8 +277,10 @@ export default function AgentBrowserViewer({ surfaceId, visible, focused, onActi
       observer.disconnect();
       document.removeEventListener('visibilitychange', syncVisibility);
       visibilityChanged.current = () => {};
+      reconnect.current = () => {};
       off();
       api.detach(surfaceId, token);
+      if (recoveryFrom) api.detach(surfaceId, recoveryFrom);
     };
   }, [surfaceId]);
 
@@ -327,6 +375,12 @@ export default function AgentBrowserViewer({ surfaceId, visible, focused, onActi
       <p className="browser-pane__blank-title">{error || (connected
         ? t('browser.agent.waitingFrame', 'Waiting for page frame…')
         : t('browser.agent.connecting', 'Connecting to page…'))}</p>
+      {error && !connected && <button className="browser-pane__setup-btn" disabled={recovering} onClick={() => reconnect.current()}>
+        {t('browser.agent.reconnect', 'Reconnect / Continue')}
+      </button>}
+      {error && !connected && onStartNew && <button className="browser-pane__setup-btn" disabled={recovering} onClick={onStartNew}>
+        {t('browser.agent.startNew', 'Start new session')}
+      </button>}
       {error && onDashboard && <button className="browser-pane__setup-btn" onClick={onDashboard}>
         {t('browser.agent.showDashboard', 'Show dashboard')}
       </button>}

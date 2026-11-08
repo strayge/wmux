@@ -74,7 +74,7 @@ import {
 import { grantFilePath, isFilePathGranted } from './file-grants';
 import { readMarkdownImage } from './markdown-image';
 import { getAwakeManager, isKeepAwakeMode } from './awake-manager';
-import { agentBrowserPath, runAgentBrowser, unwrapAgentData, type RunResult } from './agent-browser-cli';
+import { agentBrowserPath, runAgentBrowser, unwrapAgentData, observedBrowserReplacement, type RunResult } from './agent-browser-cli';
 // The process-wide singletons. Constructing a second SessionRegistry or
 // DashboardDaemon here would hand the same stream port to two surfaces and let
 // either daemon stop the dashboard out from under the other — see the header of
@@ -87,6 +87,7 @@ import {
   ensureBindableSession,
   ensureStartedSession,
   withAgentSessionTeardown,
+  SESSION_CLOSE_TIMEOUT_MS,
   releaseDashboardFor,
   sessionRegistry,
 } from './agent-browser-runtime';
@@ -552,25 +553,47 @@ export async function enableAgentBrowser(
 export async function disableAgentBrowser(
   surfaceId: SurfaceId,
   deps: AgentBrowserDeps,
+  forRestart = false,
+  skipReadback = false,
 ): Promise<AgentBrowserDisableResult> {
   return withAgentSessionTeardown(surfaceId, async (startup) => {
-    const session = deps.releaseSession(surfaceId);
+    if (forRestart && startup?.closeError) throw new Error(startup.closeError);
+    // Explicit fresh-start retries must not lose the close target on failure.
+    const session = forRestart ? deps.getSession(surfaceId) : deps.releaseSession(surfaceId);
     if (!session) {
       if (startup) await deps.releaseDashboard(surfaceId);
       return {};
     }
 
     const binary = deps.binary();
+    if (forRestart) {
+      if (!binary) throw new Error('agent-browser is not installed; the existing session could not be closed.');
+      if (!startup?.closed) {
+        const result = await deps.run(binary, agentBrowserCloseArgv(session.sessionName));
+        if (!result.ok) throw new Error(result.stderr.trim() || 'Could not close the existing browser session. Retry Start new session.');
+      }
+      deps.releaseSession(surfaceId);
+      await deps.releaseDashboard(surfaceId);
+      return {};
+    }
     let url: string | undefined;
     // A cancelled startup already closed Chrome. Reading its URL now can
     // launch another browser; the renderer's known URL is the safe fallback.
     if (binary && !startup?.closed) {
-      try {
-        url = readBackUrl(await deps.run(binary, agentBrowserGetUrlArgv(session.sessionName)));
-      } catch { /* Readback must not prevent the close. */ }
-      try {
-        await deps.run(binary, agentBrowserCloseArgv(session.sessionName));
-      } catch { /* Teardown remains best-effort. */ }
+      let replaced = false;
+      if (!startup && !skipReadback) {
+        try {
+          const result = await deps.run(binary, ['--session', session.sessionName, '--json', 'get', 'url']);
+          replaced = observedBrowserReplacement(result);
+          url = readBackUrl(result);
+        } catch { /* Readback must not prevent the close. */ }
+      }
+      // A read may itself relaunch Chrome. Never chain a close of that replacement.
+      if (!replaced) {
+        try {
+          await deps.run(binary, agentBrowserCloseArgv(session.sessionName));
+        } catch { /* Teardown remains best-effort. */ }
+      }
     }
 
     await deps.releaseDashboard(surfaceId);
@@ -590,7 +613,7 @@ export async function disableAgentBrowser(
  */
 const agentBrowserDeps: AgentBrowserDeps = {
   binary: () => agentBrowserPath(),
-  run: (binary, argv, env) => runAgentBrowser(binary, argv, undefined, env),
+  run: (binary, argv, env) => runAgentBrowser(binary, argv, argv.at(-1) === 'close' ? SESSION_CLOSE_TIMEOUT_MS : undefined, env),
   acquireDashboard: (surfaceId) => acquireDashboardFor(surfaceId),
   releaseDashboard: (surfaceId) => releaseDashboardFor(surfaceId),
   // UI enable joins the same bindable startup as CLI-first routing.
@@ -1073,6 +1096,9 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
     IPC_CHANNELS.AGENT_BROWSER_ENABLE,
     async (event, surfaceId: string, currentUrl?: string) => {
       await authorizeAgentBrowserSurface(event, windowManager, surfaceId);
+      if (!agentViewer.canEnable(surfaceId as SurfaceId)) {
+        throw new Error('Browser session is paused. Retry Start new session before enabling it.');
+      }
       ownAgentBrowserSurface(surfaceId as SurfaceId, event.sender);
       const result = await enableAgentBrowser(surfaceId as SurfaceId, currentUrl, agentBrowserDeps);
       try { await authorizeAgentBrowserSurface(event, windowManager, surfaceId); }
@@ -1081,13 +1107,29 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
     },
   );
 
-  ipcMain.handle(IPC_CHANNELS.AGENT_BROWSER_DISABLE, (event, surfaceId: string) => {
+  ipcMain.handle(IPC_CHANNELS.AGENT_BROWSER_DISABLE, async (event, surfaceId: string, forRestart?: boolean) => {
     if (!isAgentDesktopSender(event, windowManager) || agentBrowserOwners.get(surfaceId as SurfaceId) !== event.sender.id) {
       throw new Error('Unauthorized browser owner');
     }
-    agentBrowserOwners.delete(surfaceId as SurfaceId);
+    if (forRestart !== undefined && typeof forRestart !== 'boolean') throw new Error('Invalid restart request');
+    if (forRestart) {
+      const session = sessionRegistry.get(surfaceId as SurfaceId);
+      await authorizeAgentBrowserSurface(event, windowManager, surfaceId);
+      if (agentBrowserOwners.get(surfaceId as SurfaceId) !== event.sender.id || sessionRegistry.get(surfaceId as SurfaceId) !== session) {
+        throw new Error('Browser session changed before restart. Retry Start new session.');
+      }
+    }
+    // Loss evidence must survive forgetting the viewer: native URL reads can launch Chrome.
+    const skipReadback = !agentViewer.canAct(surfaceId as SurfaceId);
+    if (forRestart) {
+      const completeRestart = agentViewer.pauseForRestart(surfaceId as SurfaceId);
+      const result = await disableAgentBrowser(surfaceId as SurfaceId, agentBrowserDeps, true, skipReadback);
+      completeRestart();
+      return result;
+    }
     agentViewer.forget(surfaceId as SurfaceId);
-    return disableAgentBrowser(surfaceId as SurfaceId, agentBrowserDeps);
+    agentBrowserOwners.delete(surfaceId as SurfaceId);
+    return disableAgentBrowser(surfaceId as SurfaceId, agentBrowserDeps, false, skipReadback);
   });
 
   ipcMain.handle(IPC_CHANNELS.AGENT_VIEWER_ATTACH, async (event, id: string, token: string) => {
@@ -1101,10 +1143,25 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
       if (!event.sender.isDestroyed()) event.sender.send(IPC_CHANNELS.AGENT_VIEWER_EVENT, message);
     });
   });
+  ipcMain.handle(IPC_CHANNELS.AGENT_VIEWER_RECONNECT, async (event, id: SurfaceId, previousToken: string, token: string) => {
+    if (!isAgentDesktopSender(event, windowManager) || agentBrowserOwners.get(id) !== event.sender.id) {
+      throw new Error('Unauthorized browser owner');
+    }
+    if (typeof previousToken !== 'string') throw new Error('Invalid viewer recovery');
+    await agentViewer.attachAuthorized(id, event.sender.id, token, async () => {
+      await authorizeAgentBrowserSurface(event, windowManager, id);
+      if (agentBrowserOwners.get(id) !== event.sender.id) throw new Error('Unauthorized browser owner');
+    }, (message) => {
+      if (!event.sender.isDestroyed()) event.sender.send(IPC_CHANNELS.AGENT_VIEWER_EVENT, message);
+    }, previousToken);
+  });
   const viewerSender = (event: Pick<Electron.IpcMainEvent, 'sender' | 'senderFrame'>, id: SurfaceId): boolean =>
     isAgentDesktopSender(event, windowManager) && agentBrowserOwners.get(id) === event.sender.id;
   ipcMain.on(IPC_CHANNELS.AGENT_VIEWER_DETACH, (event, id: SurfaceId, token: string) => {
     if (isAgentDesktopSender(event, windowManager)) agentViewer.detach(id, event.sender.id, token);
+  });
+  ipcMain.on(IPC_CHANNELS.AGENT_VIEWER_FAILURE, (event, id: SurfaceId, token: string, revision: number, failure: unknown) => {
+    if (viewerSender(event, id)) agentViewer.reportFailure(id, event.sender.id, token, revision, failure);
   });
   ipcMain.on(IPC_CHANNELS.AGENT_VIEWER_ACK, (event, id: SurfaceId, token: string, frame: number, drawn: boolean) => {
     if (viewerSender(event, id)) agentViewer.ack(id, event.sender.id, token, frame, drawn);
@@ -1154,6 +1211,7 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
   /** Where the agent actually is — see the channel's note in types.ts. */
   ipcMain.handle(IPC_CHANNELS.AGENT_BROWSER_CURRENT_URL, async (event, surfaceId: string) => {
     await authorizeAgentBrowserSurface(event, windowManager, surfaceId);
+    if (!agentViewer.canAct(surfaceId as SurfaceId)) return {};
     return agentBrowserCurrentUrl(surfaceId as SurfaceId, agentBrowserDeps);
   });
 

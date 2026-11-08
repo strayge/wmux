@@ -152,7 +152,7 @@ export function resolveInputUrl(input: string): string {
 }
 
 /** Agent-mode lifecycle, as far as this pane is concerned. */
-type AgentStatus = 'idle' | 'starting' | 'live' | 'setup';
+type AgentStatus = 'idle' | 'starting' | 'live' | 'setup' | 'error';
 
 /**
  * A hidden webview an agent is driving: painted, transparent, out of the way.
@@ -267,6 +267,7 @@ export default function BrowserPane({
   const [agentTabs, setAgentTabs] = useState<AgentBrowserTab[]>([]);
   const [agentConnected, setAgentConnected] = useState(false);
   const [focusAddress, setFocusAddress] = useState(0);
+  const freshStartRef = useRef(false);
 
   // Mirrors read from webview event listeners and from callbacks that are
   // deliberately dependency-free (they are handed to a memoised child and to
@@ -586,6 +587,7 @@ export default function BrowserPane({
     setAgentConnected(false);
     setAgentTabs([]);
     setAgentError('');
+    setDashboardAvailable(false);
     setAgentUrl(url);
     if (!api) { setAgentStatus('setup'); return; }
 
@@ -593,13 +595,14 @@ export default function BrowserPane({
     try {
       result = await api.enable(surfaceId, url);
     } catch (err) {
-      if (!stale()) setAgentError(String(err));
+      if (!stale()) { setAgentError(String(err)); setAgentStatus('error'); }
       return;
     }
     if (stale()) return;
 
     if (!result?.installed) { setAgentStatus('setup'); return; }
     dashboardUrlRef.current = result.dashboardUrl ?? null;
+    freshStartRef.current = false;
     setAgentStatus('live');
     // Page never waits for the optional dashboard, including its port probe.
     void api.status().then((status: { dashboardAvailable: boolean }) => {
@@ -609,6 +612,30 @@ export default function BrowserPane({
       if (available) webviewRef.current?.loadURL(result!.dashboardUrl!).catch(() => {});
     }).catch(() => { if (!stale()) setDashboardAvailable(false); });
   }, [surfaceId]);
+
+  /** A fresh blank session is destructive and only this explicit action requests it. */
+  const startNewAgentSession = useCallback(async () => {
+    const seq = ++switchSeqRef.current;
+    const stale = () => !mountedRef.current || engineRef.current !== 'agent' || switchSeqRef.current !== seq;
+    freshStartRef.current = true;
+    setPresentation('page');
+    setAgentStatus('starting');
+    setAgentConnected(false);
+    setAgentTabs([]);
+    setAgentError('');
+    try {
+      await window.wmux.agentBrowser.disable(surfaceId, true);
+      if (stale()) return;
+      await enterAgentMode(BROWSER_BLANK_PAGE);
+    } catch (err) {
+      if (!stale()) { setAgentError(String(err)); setAgentStatus('error'); }
+    }
+  }, [enterAgentMode, surfaceId]);
+
+  const retryAgentMode = useCallback(() => {
+    if (freshStartRef.current) void startNewAgentSession();
+    else void enterAgentMode(agentUrlRef.current);
+  }, [enterAgentMode, startNewAgentSession]);
 
   const leaveAgentMode = useCallback(async () => {
     const seq = ++switchSeqRef.current;
@@ -640,7 +667,7 @@ export default function BrowserPane({
     const prev = prevEngineRef.current;
     prevEngineRef.current = engine;
     const decision = engineTransition(prev, engine, currentUrlRef.current);
-    if (decision.action === 'enable') void enterAgentMode(decision.url);
+    if (decision.action === 'enable') { freshStartRef.current = false; void enterAgentMode(decision.url); }
     else if (decision.action === 'disable') void leaveAgentMode();
   }, [engine, enterAgentMode, leaveAgentMode]);
 
@@ -767,11 +794,20 @@ export default function BrowserPane({
           // agent drives keeps painting while hidden: see webviewHiding.
           {...webviewHiding({ overlay, isBlank, isAgent, visible, keepRendering })}
         />
-        {isAgent && agentError && pageVisible && <div className="browser-pane__blank" role="alert">{agentError}</div>}
+        {isAgent && agentStatus === 'starting' && pageVisible && <div className="browser-pane__blank" role="status">
+          {t('browser.agent.starting', 'Starting browser session…')}
+        </div>}
+        {isAgent && agentStatus === 'error' && pageVisible && <div className="browser-pane__blank" role="alert">
+          <p className="browser-pane__blank-title">{agentError}</p>
+          <button className="browser-pane__setup-btn" onClick={retryAgentMode}>{t('agentBrowser.retry', 'Try again')}</button>
+          <button className="browser-pane__setup-btn" onClick={() => void startNewAgentSession()}>
+            {t('browser.agent.startNew', 'Start new session')}
+          </button>
+        </div>}
         {isAgent && agentStatus === 'live' && <AgentBrowserViewer ref={viewerRef}
           surfaceId={surfaceId} visible={visible && pageVisible} focused={focused} onActivate={onActivate}
           onPageState={(url, title) => { setAgentUrl(url); onUrlChange?.(url); if (title !== undefined) onTitleChangeRef.current?.(title); }}
-          onTabs={setAgentTabs} onConnection={setAgentConnected} onDashboard={showDashboard}
+          onTabs={setAgentTabs} onConnection={setAgentConnected} onDashboard={showDashboard} onStartNew={() => void startNewAgentSession()}
         />}
         {isBlank && !overlay && (
           <div className="browser-pane__blank">
@@ -789,8 +825,8 @@ export default function BrowserPane({
         {setupOverlay && (
           <AgentBrowserSetup
             reason={agentStatus === 'setup' ? 'not-installed' : 'no-dashboard'}
-            onInstalled={() => void enterAgentMode(agentUrlRef.current)}
-            onRetry={() => void enterAgentMode(agentUrlRef.current)}
+            onInstalled={retryAgentMode}
+            onRetry={retryAgentMode}
             onCancel={() => onEngineChange?.('web')}
           />
         )}

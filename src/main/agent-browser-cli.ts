@@ -516,3 +516,10 @@ export function unwrapAgentData(res: Pick<RunResult, 'data'>): unknown {
   }
   return d;
 }
+
+/** Operation flags prove a relaunch; effectiveLaunch only describes the current browser. */
+export function observedBrowserReplacement(res: Pick<RunResult, 'data'>): boolean {
+  const data = unwrapAgentData(res) as { lifecycle?: { launched?: unknown; relaunchedBrowser?: unknown; restartedBackground?: unknown } } | null;
+  const lifecycle = data?.lifecycle;
+  return lifecycle?.launched === true || lifecycle?.relaunchedBrowser === true || lifecycle?.restartedBackground === true;
+}

@@ -521,6 +521,8 @@ contextBridge.exposeInMainWorld('wmux', {
   // surface's engine, these change it.
   agentViewer: {
     attach: (surfaceId, token) => ipcRenderer.invoke(IPC_CHANNELS.AGENT_VIEWER_ATTACH, surfaceId, token),
+    reconnect: (surfaceId, previousToken, token) => ipcRenderer.invoke(IPC_CHANNELS.AGENT_VIEWER_RECONNECT, surfaceId, previousToken, token),
+    reportFailure: (surfaceId, token, revision, failure) => ipcRenderer.send(IPC_CHANNELS.AGENT_VIEWER_FAILURE, surfaceId, token, revision, failure),
     detach: (surfaceId, token) => ipcRenderer.send(IPC_CHANNELS.AGENT_VIEWER_DETACH, surfaceId, token),
     ack: (surfaceId, token, id, drawn) => ipcRenderer.send(IPC_CHANNELS.AGENT_VIEWER_ACK, surfaceId, token, id, drawn),
     input: (surfaceId, token, revision, input) => ipcRenderer.send(IPC_CHANNELS.AGENT_VIEWER_INPUT, surfaceId, token, revision, input),
@@ -546,9 +548,9 @@ contextBridge.exposeInMainWorld('wmux', {
       currentUrl?: string,
     ): Promise<{ installed: boolean; dashboardUrl?: string; sessionName?: string }> =>
       ipcRenderer.invoke(IPC_CHANNELS.AGENT_BROWSER_ENABLE, surfaceId, currentUrl),
-    /** Close the session, returning where it was so `web` can pick up there. Safe to call twice. */
-    disable: (surfaceId: string): Promise<{ url?: string }> =>
-      ipcRenderer.invoke(IPC_CHANNELS.AGENT_BROWSER_DISABLE, surfaceId),
+    /** Web teardown returns the URL; explicit restart skips readback and rejects a failed close so it can be retried. */
+    disable: (surfaceId: string, forRestart?: boolean): Promise<{ url?: string }> =>
+      ipcRenderer.invoke(IPC_CHANNELS.AGENT_BROWSER_DISABLE, surfaceId, forRestart),
     /**
      * Where the session's Chrome actually is. `{}` when it cannot be read.
      *

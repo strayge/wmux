@@ -610,7 +610,7 @@ export interface AgentBrowserStartupDeps {
   run: (binary: string, argv: string[], env?: NodeJS.ProcessEnv) => Promise<RunResult>;
 }
 
-const starting = new Map<SurfaceId, { promise: Promise<AgentSession>; cancelled: boolean; closed: boolean }>();
+const starting = new Map<SurfaceId, { promise: Promise<AgentSession>; cancelled: boolean; closed: boolean; closeError?: string }>();
 const stopping = new Map<SurfaceId, Promise<unknown>>();
 const started = new Map<SurfaceId, AgentSession>();
 const startupDeps: AgentBrowserStartupDeps = {
@@ -635,7 +635,7 @@ export function ensureStartedSession(
     return Promise.reject(new Error('Invalid browser URL'));
   }
   const teardown = stopping.get(id);
-  const launch = { promise: undefined as unknown as Promise<AgentSession>, cancelled: false, closed: false };
+  const launch = { promise: undefined as unknown as Promise<AgentSession>, cancelled: false, closed: false, closeError: undefined as string | undefined };
   const attempt = Promise.resolve().then(async () => {
     // A renewed enable owns its own cancellation flag, but cannot overlap the old cleanup.
     if (pending) await pending.promise.catch(() => {});
@@ -652,8 +652,9 @@ export function ensureStartedSession(
       ['--session', session.sessionName, '--pin-tab', 'open', ...(url && url !== 'about:blank' ? [url] : [])],
       { AGENT_BROWSER_STREAM_PORT: String(session.streamPort) });
     if (launch.cancelled || deps.getSession(id) !== session) {
-      await deps.run(binary, ['--session', session.sessionName, 'close']).catch(() => {});
-      launch.closed = true;
+      const closed = await deps.run(binary, ['--session', session.sessionName, 'close']).catch(() => null);
+      launch.closed = closed?.ok === true;
+      if (!launch.closed) launch.closeError = closed?.stderr.trim() || 'Could not close the cancelled browser startup. Retry Start new session.';
       throw new Error('Browser startup cancelled');
     }
     if (!res.ok) throw new Error(res.stderr.trim() || res.stdout.trim() || 'agent-browser startup failed');
@@ -668,7 +669,7 @@ export function ensureStartedSession(
 }
 
 /** Renewed launches wait for the complete prior disable, not just startup cancellation. */
-export function withAgentSessionTeardown<T>(id: SurfaceId, teardown: (startup: { closed: boolean } | undefined) => Promise<T>): Promise<T> {
+export function withAgentSessionTeardown<T>(id: SurfaceId, teardown: (startup: { closed: boolean; closeError?: string } | undefined) => Promise<T>): Promise<T> {
   const previous = stopping.get(id);
   const pending = starting.get(id);
   cancelAgentStartup(id);

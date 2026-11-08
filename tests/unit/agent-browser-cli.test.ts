@@ -7,6 +7,7 @@ import {
   resetAgentBrowserCache,
   runAgentBrowser,
   unwrapAgentData,
+  observedBrowserReplacement,
   NEGATIVE_TTL_MS,
 } from '../../src/main/agent-browser-cli';
 
@@ -416,6 +417,19 @@ describe('runAgentBrowser', () => {
     // The child still needs the inherited environment to find its own runtime,
     // so the override must MERGE rather than replace.
     expect(result.data).toEqual({ port: '9300', hasPath: true });
+  });
+});
+
+describe('observedBrowserReplacement', () => {
+  it('uses only explicit operation flags in the unwrapped native payload', () => {
+    for (const flag of ['launched', 'relaunchedBrowser', 'restartedBackground']) {
+      expect(observedBrowserReplacement({ data: { success: true, data: { lifecycle: { [flag]: true } } } })).toBe(true);
+    }
+    for (const data of [null, {}, { lifecycle: { launched: 'true' } },
+      { lifecycle: { launched: false }, effectiveLaunch: { browserLaunched: true } },
+      { effectiveLaunch: { browserLaunched: true }, browserId: 18446744073709551615 }]) {
+      expect(observedBrowserReplacement({ data })).toBe(false);
+    }
   });
 });
 

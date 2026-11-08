@@ -14,7 +14,7 @@ let decode: HTMLImageElement[];
 const draw = vi.fn();
 let width = 900, height = 640;
 const event = async (message: AgentViewerEvent['message'], revision = 1) => {
-  const token = vi.mocked(api.attach).mock.calls.at(-1)![1];
+  const token = vi.mocked(api.reconnect).mock.calls.at(-1)?.[2] ?? vi.mocked(api.attach).mock.calls.at(-1)![1];
   await act(async () => onEvent({ surfaceId: 'surf-renderer', token, revision, message }));
 };
 const present = async (revision = 1) => {
@@ -42,7 +42,7 @@ beforeEach(() => {
   });
   vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({ drawImage: draw } as any);
   vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(() => ({ left: 10, top: 20, width, height } as DOMRect));
-  api = { attach: vi.fn(async () => {}), detach: vi.fn(), ack: vi.fn(), input: vi.fn(), action: vi.fn(async () => {}),
+  api = { attach: vi.fn(async () => {}), reconnect: vi.fn(async () => {}), reportFailure: vi.fn(), detach: vi.fn(), ack: vi.fn(), input: vi.fn(), action: vi.fn(async () => {}),
     onEvent: vi.fn((callback) => { onEvent = callback; return vi.fn(); }) };
   window.wmux = { agentViewer: api };
 });
@@ -155,10 +155,10 @@ describe('renderer stream/input bridge', () => {
     vi.mocked(api.input).mockClear();
     await render(false);
     await render(true);
-    await event({ type: 'status', connected: true, width: 900, height: 640 });
+    await event({ type: 'status', connected: true, width: 900, height: 640 }, 2);
     await tryInput();
     expect(api.input).not.toHaveBeenCalled();
-    await present();
+    await present(2);
     await dispatchText('reattached');
     expect(api.input).toHaveBeenCalledOnce();
   });
@@ -292,6 +292,65 @@ describe('renderer stream/input bridge', () => {
       expect.objectContaining({ eventType: 'mouseReleased', button: 'left' }),
       expect.objectContaining({ eventType: 'mouseWheel', deltaY: 700, button: 'none' }),
     ]);
+  });
+
+  it('reports decode failure to main, ignores later frames/status and offers explicit recovery with a new token', async () => {
+    await render();
+    await event({ type: 'status', connected: true, width: 900, height: 640 });
+    await event({ type: 'frame', id: 1, data: 'AAAA', width: 900, height: 640 });
+    await act(async () => decode[0].onerror?.(new Event('error')));
+    const oldToken = vi.mocked(api.attach).mock.calls[0][1];
+    expect(api.reportFailure).toHaveBeenCalledExactlyOnceWith('surf-renderer', oldToken, 1, 'decode');
+    expect(container.textContent).toContain('Could not decode');
+    await render(false);
+    await render(true);
+    await event({ type: 'status', connected: true, width: 900, height: 640 });
+    await dispatchText('paused');
+    expect(api.input).not.toHaveBeenCalled();
+    const reconnect = Array.from(container.querySelectorAll('button')).find((button) => button.textContent === 'Reconnect / Continue')!;
+    await act(async () => reconnect.click());
+    expect(api.reconnect).toHaveBeenCalledExactlyOnceWith('surf-renderer', oldToken, expect.not.stringMatching(oldToken));
+    expect(api.attach).toHaveBeenCalledOnce();
+    await event({ type: 'status', connected: true, width: 900, height: 640 }, 0);
+    await present(0);
+    await dispatchText('continued');
+    expect(api.input).toHaveBeenCalledOnce();
+    await act(async () => decode[0].onload?.(new Event('load')));
+    expect(draw).toHaveBeenCalledOnce();
+    expect(api.ack).toHaveBeenLastCalledWith('surf-renderer', oldToken, 1, false);
+  });
+
+  it('keeps ordinary command errors dismissible without reconnect or restarting', async () => {
+    await render();
+    await event({ type: 'status', connected: true, width: 900, height: 640 });
+    await present();
+    vi.mocked(api.action).mockRejectedValueOnce(new Error('Selection failed'));
+    await dispatchKey('keydown', 'c', 'KeyC', 67, true);
+    expect(container.textContent).toContain('Selection failed');
+    const dismiss = Array.from(container.querySelectorAll('button')).find((button) => button.textContent === 'Dismiss')!;
+    await act(async () => dismiss.click());
+    expect(container.textContent).not.toContain('Selection failed');
+    expect(api.reportFailure).not.toHaveBeenCalled();
+    expect(api.reconnect).not.toHaveBeenCalled();
+  });
+
+  it('keeps failed recovery retryable and fences a pending recovery on unmount', async () => {
+    await render();
+    await event({ type: 'error', message: 'Disconnected' });
+    vi.mocked(api.reconnect).mockRejectedValueOnce(new Error('Unauthorized'));
+    const clickReconnect = async () => {
+      const button = Array.from(container.querySelectorAll('button')).find((el) => el.textContent === 'Reconnect / Continue')!;
+      await act(async () => button.click());
+    };
+    await clickReconnect();
+    expect(container.textContent).toContain('Unauthorized');
+    vi.mocked(api.reconnect).mockImplementationOnce(() => new Promise(() => {}));
+    await clickReconnect();
+    const calls = vi.mocked(api.reconnect).mock.calls;
+    expect(calls[1][1]).toBe(calls[0][1]);
+    await act(async () => root.render(null));
+    expect(api.detach).toHaveBeenCalledWith('surf-renderer', calls[1][2]);
+    expect(api.detach).toHaveBeenCalledWith('surf-renderer', calls[1][1]);
   });
 
   it('maps coordinates using viewport dimensions, not image pixels or scroll metadata', () => {

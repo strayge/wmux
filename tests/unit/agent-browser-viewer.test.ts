@@ -165,12 +165,126 @@ describe('surface stream subscriptions', () => {
     expect(h.viewer.canAct(ID)).toBe(true);
   });
 
+  it('reconnects only the existing stream with a fresh token and authoritative state, without native commands or replay', async () => {
+    const h = harness();
+    h.present();
+    const queued = h.viewer.action(ID, 10, 'token-a', 1, { type: 'reload' }).catch(() => {});
+    const lateError = h.sockets[0].listeners('error')[0] as () => void;
+    h.receive({ ...protocol.status, connected: false });
+    await queued;
+    expect(() => h.viewer.attach(ID, 10, 'remount', () => {})).toThrow('unavailable');
+    await h.viewer.attachAuthorized(ID, 10, 'recovered', async () => {}, (e) => h.events.push(e), 'remount');
+    lateError();
+    h.receive(protocol.status);
+    h.receive(protocol.tabs);
+    h.receive(protocol.url);
+    expect(h.viewer.canAct(ID)).toBe(true);
+    expect(h.events.slice(-3).map((e) => [e.token, e.message.type])).toEqual([
+      ['recovered', 'status'], ['recovered', 'tabs'], ['recovered', 'url'],
+    ]);
+    expect(h.connect).toHaveBeenCalledTimes(2);
+    expect(h.run).not.toHaveBeenCalled();
+    await expect(h.viewer.action(ID, 10, 'remount', 1, { type: 'reload' })).rejects.toThrow();
+    await expect(h.viewer.action(ID, 10, 'recovered', 1, { type: 'paste' })).rejects.toThrow('frame');
+  });
+
+  it.each(['unauthorized', 'detach', 'teardown', 'newer-attach'])('does not let %s recovery clear a pause or affect later subscriptions', async (mode) => {
+    const h = harness();
+    h.receive({ ...protocol.status, connected: false });
+    let authorize!: () => void;
+    const recovery = h.viewer.attachAuthorized(ID, 10, 'recovering', () => new Promise<void>((resolve, reject) => {
+      authorize = () => mode === 'unauthorized' ? reject(new Error('Unauthorized')) : resolve();
+    }), () => {}, 'token-a').catch((err) => err);
+    if (mode === 'detach') h.viewer.detach(ID, 10, 'recovering');
+    if (mode === 'teardown') {
+      h.viewer.forget(ID);
+      h.viewer.attach(ID, 10, 'new-session', (e) => h.events.push(e));
+      h.receive({ ...protocol.status, connected: false });
+    }
+    if (mode === 'newer-attach') expect(() => h.viewer.attach(ID, 10, 'newer', () => {})).toThrow();
+    authorize();
+    await recovery;
+    expect(h.viewer.canAct(ID)).toBe(false);
+    expect(h.connect).toHaveBeenCalledTimes(mode === 'teardown' ? 2 : 1);
+  });
+
+  it('does not let delayed recovery clear a newly observed loss or a changed registry session', async () => {
+    for (const change of ['loss', 'session']) {
+      const h = harness();
+      let authorize!: () => void;
+      const pending = h.viewer.attachAuthorized(ID, 10, 'recovery', () => new Promise<void>((resolve) => { authorize = resolve; }), () => {}, 'token-a');
+      if (change === 'session') h.replaceSession();
+      h.receive({ ...protocol.status, connected: false });
+      authorize();
+      await expect(pending).rejects.toThrow('Stale');
+      expect(h.viewer.canAct(ID)).toBe(false);
+      expect(h.connect).toHaveBeenCalledOnce();
+    }
+  });
+
+  it('rejects wrong-owner/stale recovery and preserves a retryable pause when connect throws', async () => {
+    const h = harness();
+    h.receive({ ...protocol.status, connected: false });
+    const authorize = vi.fn(async () => {});
+    for (const [owner, token] of [[99, 'token-a'], [10, 'stale']] as const) {
+      await expect(h.viewer.attachAuthorized(ID, owner, 'new-token', authorize, () => {}, token)).rejects.toThrow('Stale');
+    }
+    expect(authorize).not.toHaveBeenCalled();
+    h.connect.mockImplementationOnce(() => { throw new Error('socket failed'); });
+    await expect(h.viewer.attachAuthorized(ID, 10, 'new-token', authorize, () => {}, 'token-a')).rejects.toThrow('socket failed');
+    expect(h.viewer.canAct(ID)).toBe(false);
+    await h.viewer.attachAuthorized(ID, 10, 'retry', authorize, () => {}, 'token-a');
+    expect(h.viewer.canAct(ID)).toBe(true);
+  });
+
+  it('accepts only a current finite decode report and keeps it paused after detach/remount', () => {
+    const h = harness();
+    for (const [owner, token, revision, failure] of [[99, 'token-a', 1, 'decode'], [10, 'old', 1, 'decode'], [10, 'token-a', 0, 'decode'], [10, 'token-a', 1, 'arbitrary error']] as const) {
+      h.viewer.reportFailure(ID, owner, token, revision, failure);
+      expect(h.viewer.canAct(ID)).toBe(true);
+    }
+    h.viewer.reportFailure(ID, 10, 'token-a', 1, 'decode');
+    h.viewer.detach(ID, 10, 'token-a');
+    expect(() => h.viewer.attach(ID, 10, 'remount', () => {})).toThrow('decode');
+    expect(h.sockets[0].listenerCount('message')).toBe(0);
+    expect(h.sockets[0].listenerCount('close')).toBe(0);
+    expect(h.sockets[0].terminate).toHaveBeenCalledOnce();
+  });
+
+  it('keeps a failed-restart pause gated even with an available session, without blocking ordinary Dashboard reuse', async () => {
+    const h = harness();
+    h.receive({ ...protocol.status, connected: false });
+    expect(h.viewer.canEnable(ID)).toBe(true);
+    const complete = h.viewer.pauseForRestart(ID);
+    expect(h.viewer.canEnable(ID)).toBe(false);
+    expect(h.viewer.canAct(ID)).toBe(false);
+    expect(() => h.viewer.attach(ID, 10, 'remount', () => {})).toThrow('Close the previous');
+    await expect(h.viewer.attachAuthorized(ID, 10, 'recovery', async () => {}, () => {}, 'remount')).rejects.toThrow('Close the previous');
+    expect(h.connect).toHaveBeenCalledOnce();
+    complete();
+    expect(h.viewer.canEnable(ID)).toBe(true);
+    expect(h.viewer.canAct(ID)).toBe(true);
+  });
+
+  it('never lets a late successful restart clear a later session pause', () => {
+    const h = harness();
+    const completeOld = h.viewer.pauseForRestart(ID);
+    h.viewer.forget(ID);
+    h.viewer.attach(ID, 10, 'new-session', (event) => h.events.push(event));
+    h.receive({ ...protocol.status, connected: false });
+    completeOld();
+    expect(h.viewer.canAct(ID)).toBe(false);
+    expect(() => h.viewer.attach(ID, 10, 'remount', () => {})).toThrow('unavailable');
+  });
+
   it('does not dispatch against a replacement registry session', async () => {
     const h = harness();
     h.replaceSession();
     h.viewer.input(ID, 10, 'token-a', 1, key);
     await expect(h.viewer.action(ID, 10, 'token-a', 1, { type: 'copy' })).rejects.toThrow();
     expect(h.run).not.toHaveBeenCalled();
+    expect(h.viewer.canAct(ID)).toBe(false);
+    expect(h.events.at(-1)?.message).toMatchObject({ type: 'error', message: expect.stringContaining('session changed') });
   });
 
   it('rejects malformed known protocol with a readable error', () => {
@@ -561,6 +675,42 @@ describe('finite native actions and input', () => {
     });
     await h.viewer.action(ID, 10, 'token-a', 1, { type: 'tab-close', tabId: 't1' });
     expect(h.run.mock.calls.map((call) => call[1])).toEqual([['tab', 'new', 'about:blank'], ['tab', 'close', 't1']]);
+  });
+
+  it.each(['launched', 'relaunchedBrowser', 'restartedBackground'])('stops queued work and the dependent close on native lifecycle.%s, even on a failed result', async (flag) => {
+    const h = harness();
+    h.run.mockResolvedValueOnce({ ...ok, ok: false, data: { success: false, data: { lifecycle: { [flag]: true }, tabId: 't9' } } } as typeof ok);
+    const close = h.viewer.action(ID, 10, 'token-a', 1, { type: 'tab-close', tabId: 't1' });
+    const reload = h.viewer.action(ID, 10, 'token-a', 1, { type: 'reload' });
+    await expect(close).rejects.toThrow('session changed');
+    await expect(reload).rejects.toThrow();
+    expect(h.run.mock.calls.map((call) => call[1])).toEqual([['tab', 'new', 'about:blank']]);
+    expect(h.viewer.canAct(ID)).toBe(false);
+    expect(h.events.at(-1)?.message).toMatchObject({ type: 'error', message: expect.stringContaining('not retried') });
+  });
+
+  it('observes a late native replacement after hiding but never lets an obsolete subscription pause its replacement', async () => {
+    for (const replace of [false, true]) {
+      const h = harness();
+      let finish!: (result: typeof ok) => void;
+      h.run.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+      const action = h.viewer.action(ID, 10, 'token-a', 1, { type: 'reload' }).catch(() => {});
+      await vi.waitFor(() => expect(finish).toBeTypeOf('function'));
+      await h.viewer.action(ID, 10, 'token-a', 1, { type: 'visibility', visible: false });
+      if (replace) h.viewer.attach(ID, 10, 'replacement', () => {});
+      finish({ ...ok, data: { lifecycle: { launched: true } } } as typeof ok);
+      await action;
+      expect(h.viewer.canAct(ID)).toBe(replace);
+    }
+  });
+
+  it('does not infer replacement from effectiveLaunch browser state or imprecise numeric identities', async () => {
+    const h = harness();
+    h.run.mockResolvedValue({ ...ok, data: { tabId: 't9', lifecycle: { launched: false, relaunchedBrowser: false, restartedBackground: false },
+      effectiveLaunch: { browserLaunched: true }, browserId: 18446744073709551615 } } as typeof ok);
+    await h.viewer.action(ID, 10, 'token-a', 1, { type: 'tab-close', tabId: 't1' });
+    expect(h.run.mock.calls.map((call) => call[1])).toEqual([['tab', 'new', 'about:blank'], ['tab', 'close', 't1']]);
+    expect(h.viewer.canAct(ID)).toBe(true);
   });
 
   it('validates finite mouse/key messages and strips arbitrary CDP/argv fields', () => {
