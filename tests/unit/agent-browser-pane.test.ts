@@ -1,12 +1,24 @@
 // @vitest-environment jsdom
-import { act, createElement } from 'react';
+import { act, createElement, useEffect, useImperativeHandle, type Ref } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import BrowserPane, { disableTarget, engineTransition, resolveInputUrl, webviewHiding } from '../../src/renderer/components/Browser/BrowserPane';
 
+const viewerAction = vi.hoisted(() => vi.fn(async (_action: unknown) => {}));
+const tabs = [
+  { tabId: 't1', title: 'First', url: 'https://initial.test/', active: true },
+  { tabId: 't9', title: 'Other', url: 'https://other.test/', active: false },
+];
 vi.mock('../../src/renderer/components/Browser/AgentBrowserViewer', () => ({
-  default: (props: { visible: boolean; onPageState: (url: string, title: string) => void }) =>
-    createElement('button', { 'data-viewer': String(props.visible), onClick: () => props.onPageState('https://agent.test/next', 'Agent title') }, 'fixture page'),
+  default: function Viewer(props: { visible: boolean; ref: Ref<{ action: typeof viewerAction }>;
+    onPageState: (url: string, title: string) => void; onConnection: (connected: boolean) => void; onTabs: (tabs: unknown[]) => void }) {
+    useImperativeHandle(props.ref, () => ({ action: viewerAction }));
+    useEffect(() => { props.onConnection(true); }, []);
+    return createElement('button', { 'data-viewer': String(props.visible), onClick: () => {
+      props.onPageState('https://agent.test/next', 'Agent title');
+      props.onTabs(tabs);
+    } }, 'fixture page');
+  },
 }));
 
 let root: Root;
@@ -19,6 +31,7 @@ beforeEach(() => {
   container = document.createElement('div');
   document.body.append(container);
   root = createRoot(container);
+  viewerAction.mockClear();
   loadURL = vi.fn(async () => {});
   Object.defineProperty(HTMLElement.prototype, 'loadURL', { value: loadURL, configurable: true });
   api = { enable: vi.fn(async () => ({ installed: true, dashboardUrl: 'https://dashboard.test/' })),
@@ -61,9 +74,11 @@ describe('Page presentation', () => {
     await render();
     const outer = container.querySelector('.browser-pane');
     const webview = container.querySelector('webview');
-    await click('Dashboard');
-    expect(container.querySelector('[data-viewer]')).toBeNull();
-    await click('Page');
+    await click('…');
+    await click('Show dashboard');
+    expect(container.querySelector('[data-viewer="false"]')).toBeTruthy();
+    await click('…');
+    await click('Return to page');
     expect(container.querySelector('[data-viewer="true"]')).toBeTruthy();
     expect(container.querySelector('.browser-pane')).toBe(outer);
     expect(container.querySelector('webview')).toBe(webview);
@@ -90,6 +105,61 @@ describe('Page presentation', () => {
     await act(async () => vi.advanceTimersByTimeAsync(30000));
     expect(api.currentUrl).not.toHaveBeenCalled();
     expect(api.enable).toHaveBeenCalledTimes(1);
+  });
+
+  it('routes menu, stable tab controls and refresh to Chrome even while showing Dashboard', async () => {
+    await render({ onEngineChange: vi.fn() });
+    expect(container.querySelector('.browser-pane__chrome-tabs')).toBeNull();
+    await click('fixture page');
+    expect(container.querySelectorAll('.browser-pane__chrome-tab')).toHaveLength(2);
+    await click('Other');
+    const close = container.querySelectorAll<HTMLButtonElement>('[aria-label="Close tab"]')[1];
+    await act(async () => close.click());
+    expect(viewerAction.mock.calls.map((call) => call[0])).toEqual([{ type: 'tab-select', tabId: 't9' }, { type: 'tab-close', tabId: 't9' }]);
+    await click('…');
+    await click('Show dashboard');
+    await click('←');
+    await click('→');
+    await click('↻');
+    await act(async () => document.dispatchEvent(new CustomEvent('wmux:refresh-surface', { detail: { surfaceId: 'surf-pane' } })));
+    expect(viewerAction.mock.calls.slice(-4).map((call) => call[0])).toEqual([{ type: 'back' }, { type: 'forward' }, { type: 'reload' }, { type: 'reload' }]);
+    await click('…');
+    await click('New tab');
+    expect(viewerAction).toHaveBeenLastCalledWith({ type: 'tab-new' });
+    expect(container.querySelector('[data-viewer="true"]')).toBeTruthy();
+    expect(document.activeElement).toBe(container.querySelector('input'));
+    expect(container.querySelector('input')?.value).toBe('');
+    expect(api.open).not.toHaveBeenCalled();
+    expect(api.enable).toHaveBeenCalledOnce();
+    expect(api.disable).not.toHaveBeenCalled();
+  });
+
+  it('preserves an address edit across authoritative agent URL/title updates until blur', async () => {
+    await render();
+    const input = container.querySelector('input')!;
+    await act(async () => {
+      input.focus();
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, 'draft.example');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await click('fixture page');
+    expect(input.value).toBe('draft.example');
+    await act(async () => input.blur());
+    expect(input.value).toBe('https://agent.test/next');
+  });
+
+  it('leaves Web refresh and address navigation on the guest, with no Agent menu', async () => {
+    const reload = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, 'reload', { value: reload, configurable: true });
+    try {
+      await render({ engine: 'web' });
+      expect(container.querySelector('[aria-label="Browser menu"]')).toBeNull();
+      await act(async () => document.dispatchEvent(new CustomEvent('wmux:refresh-surface', { detail: { surfaceId: 'surf-pane' } })));
+      expect(reload).toHaveBeenCalledOnce();
+      await act(async () => window.dispatchEvent(new CustomEvent('wmux:browser-navigate', { detail: { surfaceId: 'surf-pane', url: 'example.com' } })));
+      expect(loadURL).toHaveBeenLastCalledWith('https://example.com');
+      expect(viewerAction).not.toHaveBeenCalled();
+    } finally { delete (HTMLElement.prototype as any).reload; }
   });
 
   it('reports startup failure instead of presenting a ready page', async () => {

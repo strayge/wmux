@@ -26,11 +26,25 @@ interface Subscription {
   emit: (event: AgentViewerEvent) => void;
   revision: number;
   activeTab?: string;
+  tabs: AgentBrowserTab[];
+  visible: boolean;
+  workRevision: number;
+  tabOperation?: {
+    ids: string[];
+    originalActive?: string;
+    target?: string;
+    creating: boolean;
+    closing?: string;
+    closeDispatched: boolean;
+    changed: boolean;
+    unexpected: boolean;
+  };
   ready: boolean;
   inFlight?: number;
   inFlightRevision?: number;
   presentedRevision?: number;
   pending?: Extract<AgentViewerMessage, { type: 'frame' }>;
+  latest?: Extract<AgentViewerMessage, { type: 'frame' }>;
   nextFrame: number;
   queue: Promise<void>;
   queued: number;
@@ -111,7 +125,7 @@ export class AgentBrowserViewer {
     if (failure) throw new Error(failure);
     const socket = this.deps.connect(`ws://127.0.0.1:${session.streamPort}/?pacing=ack&maxFps=30`);
     const sub: Subscription = { surfaceId, owner, token, session, socket, emit, revision: 0,
-      ready: false, nextFrame: 0, queue: Promise.resolve(), queued: 0 };
+      ready: false, tabs: [], visible: true, workRevision: 0, nextFrame: 0, queue: Promise.resolve(), queued: 0 };
     this.subscriptions.set(surfaceId, sub);
     socket.on('message', (data) => {
       if (!this.current(sub)) return;
@@ -154,7 +168,8 @@ export class AgentBrowserViewer {
           || !dimension(v.metadata?.deviceWidth) || !dimension(v.metadata?.deviceHeight)) throw new Error('Invalid frame');
         const frame: Extract<AgentViewerMessage, { type: 'frame' }> = { type: 'frame', id: ++sub.nextFrame,
           data: v.data, width: v.metadata.deviceWidth, height: v.metadata.deviceHeight };
-        if (sub.inFlight === undefined) {
+        sub.latest = frame;
+        if (sub.visible && sub.inFlight === undefined) {
           sub.inFlight = frame.id;
           sub.inFlightRevision = sub.revision;
           this.send(sub, frame);
@@ -170,11 +185,26 @@ export class AgentBrowserViewer {
             || !text(tab.title) || !text(tab.url, 65536) || typeof tab.active !== 'boolean') throw new Error('Invalid tab');
           return { tabId: tab.tabId, title: tab.title, url: tab.url, active: tab.active };
         });
+        if (new Set(tabs.map((tab) => tab.tabId)).size !== tabs.length || tabs.filter((tab) => tab.active).length > 1) throw new Error('Invalid tabs');
         const active = tabs.find((tab) => tab.active)?.tabId;
+        const op = sub.tabOperation;
+        if (op) {
+          const ids = tabs.map((tab) => tab.tabId);
+          const sameIds = (expected: string[]) => ids.length === expected.length && expected.every((id) => ids.includes(id));
+          const unchanged = !op.changed && active === op.originalActive && sameIds(op.ids);
+          if (op.creating && !op.target && active && !op.ids.includes(active)) op.target = active;
+          const activatedIds = op.creating && op.target ? [...op.ids, op.target] : op.ids;
+          const activated = active === op.target && sameIds(activatedIds);
+          const closed = op.closeDispatched && active === op.target && sameIds(activatedIds.filter((id) => id !== op.closing));
+          if (!unchanged && !activated && !closed) op.unexpected = true;
+          if (!unchanged) op.changed = true;
+        }
+        sub.tabs = tabs;
         if (sub.activeTab !== active) {
           sub.revision++;
           sub.presentedRevision = undefined;
           sub.pending = undefined;
+          sub.latest = undefined;
           sub.activeTab = active;
         }
         this.send(sub, { type: 'tabs', tabs });
@@ -197,10 +227,10 @@ export class AgentBrowserViewer {
   ack(id: SurfaceId, owner: number, token: string, frameId: number, drawn: boolean): void {
     const sub = this.owned(id, owner, token);
     if (!sub || sub.inFlight !== frameId) return;
-    if (drawn === true && sub.inFlightRevision === sub.revision) sub.presentedRevision = sub.revision;
+    if (drawn === true && sub.visible && sub.inFlightRevision === sub.revision) sub.presentedRevision = sub.revision;
     sub.inFlight = undefined;
     sub.inFlightRevision = undefined;
-    if (sub.pending) {
+    if (sub.visible && sub.pending) {
       const frame = sub.pending;
       sub.pending = undefined;
       sub.inFlight = frame.id;
@@ -216,9 +246,10 @@ export class AgentBrowserViewer {
       return Promise.reject(new Error('Page input queue is full'));
     }
     sub.queued++;
+    const workRevision = sub.workRevision;
     const run = sub.queue.then(() => {
-      if (!this.current(sub) || !sub.ready || sub.revision !== revision) throw new Error('Stale page action');
-      if (requireFrame && sub.presentedRevision !== revision) throw new Error('Page frame is not presented');
+      if (!this.current(sub) || !sub.ready || sub.revision !== revision || sub.workRevision !== workRevision) throw new Error('Stale page action');
+      if (requireFrame && (!sub.visible || sub.presentedRevision !== revision)) throw new Error('Page frame is not presented');
       return work();
     }).finally(() => { sub.queued--; });
     sub.queue = run.catch(() => {});
@@ -228,7 +259,7 @@ export class AgentBrowserViewer {
   input(id: SurfaceId, owner: number, token: string, revision: number, raw: unknown): void | Promise<void> {
     const sub = this.owned(id, owner, token);
     const input = validatedViewerInput(raw);
-    if (!sub?.ready || sub.revision !== revision || sub.presentedRevision !== revision
+    if (!sub?.ready || !sub.visible || sub.tabOperation || sub.revision !== revision || sub.presentedRevision !== revision
       || !input || sub.socket.readyState !== WebSocket.OPEN) return;
     return this.enqueue(sub, revision, true, () => {
       if (sub.socket.readyState !== WebSocket.OPEN || sub.socket.bufferedAmount > 65536) {
@@ -242,12 +273,36 @@ export class AgentBrowserViewer {
   async action(id: SurfaceId, owner: number, token: string, revision: number, raw: unknown): Promise<void> {
     const sub = this.owned(id, owner, token);
     const action = raw as AgentViewerAction;
-    if (!sub?.ready || sub.revision !== revision || !action) throw new Error('Page is not interactive');
-    if (action.type !== 'viewport' && sub.presentedRevision !== revision) throw new Error('Page frame is not presented');
+    if (!sub || !action) throw new Error('Page is not interactive');
+    if (action.type === 'visibility') {
+      if (typeof action.visible !== 'boolean') throw new Error('Invalid visibility');
+      sub.visible = action.visible;
+      sub.workRevision++;
+      sub.presentedRevision = undefined;
+      sub.inFlightRevision = undefined;
+      // Static pages need not emit another frame after an unchanged viewport.
+      // Replay only the current-tab cache, with a fresh draw acknowledgment.
+      if (sub.visible && sub.latest) sub.pending = { ...sub.latest, id: ++sub.nextFrame };
+      if (sub.visible && sub.inFlight === undefined && sub.pending) {
+        const frame = sub.pending;
+        sub.pending = undefined;
+        sub.inFlight = frame.id;
+        sub.inFlightRevision = sub.revision;
+        this.send(sub, frame);
+      }
+      return;
+    }
+    if (!sub.ready || sub.revision !== revision) throw new Error('Page is not interactive');
+    const requireFrame = action.type === 'copy' || action.type === 'paste';
+    if (requireFrame && (!sub.visible || sub.tabOperation || sub.presentedRevision !== revision)) throw new Error('Page frame is not presented');
+    if (action.type === 'tab-new' || action.type === 'tab-select' || action.type === 'tab-close') {
+      if (action.type !== 'tab-new' && (typeof action.tabId !== 'string' || !/^t[1-9]\d{0,15}$/.test(action.tabId))) throw new Error('Invalid tab ID');
+      return this.enqueue(sub, revision, false, () => this.tabAction(sub, action));
+    }
     let argv: string[];
     switch (action.type) {
       case 'viewport':
-        if (!dimension(action.width) || !dimension(action.height)) throw new Error('Invalid viewport');
+        if (!sub.visible || !dimension(action.width) || !dimension(action.height)) throw new Error('Invalid viewport');
         argv = ['set', 'viewport', String(action.width), String(action.height)]; break;
       case 'paste': {
         const value = this.deps.readClipboard();
@@ -261,19 +316,27 @@ export class AgentBrowserViewer {
         break;
       }
       case 'copy': argv = ['eval', COPY_SELECTION]; break;
+      case 'navigate':
+        if (!text(action.url, 65536) || !/^(https?|file|about):/i.test(action.url)) throw new Error('Invalid browser URL');
+        argv = ['open', action.url]; break;
+      case 'back': case 'forward': case 'reload': argv = [action.type]; break;
       default: throw new Error('Invalid page action');
     }
-    return this.enqueue(sub, revision, action.type !== 'viewport', async () => {
+    const workRevision = sub.workRevision;
+    return this.enqueue(sub, revision, requireFrame, async () => {
+      if (action.type === 'viewport' && !sub.visible) throw new Error('Page is hidden');
       let res: RunResult;
       try { res = await this.deps.run(sub.session, argv); }
       catch (err) {
-        if (this.current(sub) && sub.revision === revision) this.fail(sub, 'Native page action could not be launched.');
+        if (this.current(sub) && sub.revision === revision && sub.workRevision === workRevision) this.fail(sub, 'Native page action could not be launched.');
         throw err;
       }
-      if (!this.current(sub) || sub.revision !== revision) throw new Error('Stale page action');
+      if (!this.current(sub) || sub.revision !== revision || sub.workRevision !== workRevision) throw new Error('Stale page action');
       if (!res.ok) {
-        this.fail(sub, res.stderr.trim() || 'Native page action failed.');
-        throw new Error('Native page action failed');
+        const message = res.stderr.trim() || 'Native page action failed.';
+        // A history boundary or rejected navigation is not evidence of browser loss.
+        if (action.type === 'viewport' || requireFrame) this.fail(sub, message);
+        throw new Error(message);
       }
       if (action.type === 'copy') {
         const data = unwrapAgentData(res) as { result?: unknown } | null;
@@ -282,6 +345,68 @@ export class AgentBrowserViewer {
         if (value) this.deps.writeClipboard(value);
       }
     });
+  }
+
+  /** A close always addresses the original ID, after a safe active replacement. */
+  private async tabAction(sub: Subscription, action: Extract<AgentViewerAction, { type: 'tab-new' | 'tab-select' | 'tab-close' }>): Promise<void> {
+    const ids = sub.tabs.map((tab) => tab.tabId);
+    if (action.type !== 'tab-new' && !ids.includes(action.tabId)) throw new Error('Tab is no longer available');
+    const closing = action.type === 'tab-close' ? action.tabId : undefined;
+    const creating = action.type === 'tab-new' || (closing === sub.activeTab && ids.length === 1);
+    const index = closing ? ids.indexOf(closing) : -1;
+    const target = action.type === 'tab-select' ? action.tabId : creating ? undefined
+      : closing === sub.activeTab ? ids[index + 1] ?? ids[index - 1] : sub.activeTab;
+    if (action.type === 'tab-select' && target === sub.activeTab) return;
+    const revision = sub.revision;
+    let switched = false;
+    const op = { ids, originalActive: sub.activeTab, target, creating, closing,
+      closeDispatched: false, changed: false, unexpected: false };
+    sub.tabOperation = op;
+    // Work queued against the pre-command target is obsolete even if the
+    // authoritative stream update follows the native command's completion.
+    sub.workRevision++;
+    const check = () => {
+      if (!this.current(sub) || !sub.ready || op.unexpected) throw new Error('Tabs changed while the action was running.');
+    };
+    const run = async (argv: string[]) => {
+      check();
+      const result = await this.deps.run(sub.session, argv);
+      check();
+      if (!result.ok) throw new Error(result.stderr.trim() || 'Native tab action failed.');
+      return result;
+    };
+    try {
+      if (creating) {
+        const result = await run(['tab', 'new', 'about:blank']);
+        switched = true;
+        const data = unwrapAgentData(result) as { tabId?: unknown } | null;
+        if (typeof data?.tabId !== 'string' || !/^t[1-9]\d{0,15}$/.test(data.tabId)
+          || ids.includes(data.tabId) || (op.target && op.target !== data.tabId)) throw new Error('Could not confirm the new tab.');
+        // Native tab-new already activates it. The result covers a stream update
+        // arriving after command completion; it never substitutes a visual index.
+        op.target = data.tabId;
+      } else if (target && target !== sub.activeTab) {
+        await run(['tab', target]);
+        switched = true;
+      }
+      if (closing) {
+        check();
+        op.closeDispatched = true;
+        await run(['tab', 'close', closing]);
+      }
+    } finally {
+      if (sub.tabOperation === op) {
+        sub.tabOperation = undefined;
+        // Observed tab changes already fence old frames by revision. Do not
+        // discard a new target's drawn frame, or the original after a refusal.
+        if (switched && sub.revision === revision) {
+          sub.presentedRevision = undefined;
+          sub.inFlightRevision = undefined;
+          sub.pending = undefined;
+          sub.latest = undefined;
+        }
+      }
+    }
   }
 
   detach(id: SurfaceId, owner: number, token: string): void {
@@ -306,6 +431,7 @@ export class AgentBrowserViewer {
     if (!sub) return;
     this.subscriptions.delete(id);
     sub.pending = undefined;
+    sub.latest = undefined;
     sub.ready = false;
     // Keep the error listener until close: terminating a connecting ws emits an error.
     sub.socket.removeAllListeners('message');

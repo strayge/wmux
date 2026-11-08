@@ -897,6 +897,17 @@ export const en = {
   'addressBar.reloadViewer': 'Reload the activity viewer (does not reload the page the agent is on)',
   // A browser surface with no page yet (#232). wmux used to answer this with its
   // own GitHub repo, which it then remembered as if the user had chosen it.
+  'browser.agent.connected': 'Page connected',
+  'browser.agent.disconnected': 'Page disconnected',
+  'browser.agent.connecting': 'Connecting to page…',
+  'browser.agent.waitingFrame': 'Waiting for page frame…',
+  'browser.agent.menu': 'Browser menu',
+  'browser.agent.newTab': 'New tab',
+  'browser.agent.closeTab': 'Close tab',
+  'browser.agent.tabs': 'Browser tabs',
+  'browser.agent.showDashboard': 'Show dashboard',
+  'browser.agent.returnToPage': 'Return to page',
+  'browser.agent.dismissError': 'Dismiss',
   'browser.blank.title': 'No page open',
   'browser.blank.hint': 'Type a URL above, or set a start page in Settings → Browser.',
   // The browser panel's right-click menu (#439). Chrome's wording, so the

@@ -339,6 +339,230 @@ describe('finite native actions and input', () => {
     expect(h.viewer.canAct(ID)).toBe(false);
   });
 
+  it('uses finite navigation commands without a drawn frame and does not pause at history boundaries', async () => {
+    const h = harness();
+    h.run.mockResolvedValueOnce({ ...ok, ok: false, stderr: 'No history entry' });
+    await expect(h.viewer.action(ID, 10, 'token-a', 1, { type: 'back' })).rejects.toThrow('No history');
+    expect(h.viewer.canAct(ID)).toBe(true);
+    for (const type of ['forward', 'reload']) await h.viewer.action(ID, 10, 'token-a', 1, { type });
+    await h.viewer.action(ID, 10, 'token-a', 1, { type: 'navigate', url: 'file:///C:/fixture.html' });
+    for (const url of ['chrome://extensions', 'javascript:alert(1)', '--version']) {
+      await expect(h.viewer.action(ID, 10, 'token-a', 1, { type: 'navigate', url })).rejects.toThrow('Invalid');
+    }
+    expect(h.run.mock.calls.map((call) => call[1])).toEqual([['back'], ['forward'], ['reload'], ['open', 'file:///C:/fixture.html']]);
+  });
+
+  it('suspends frames/input/queued viewport writes while hidden, retaining only the newest frame', async () => {
+    const h = harness();
+    h.present();
+    const resize = h.viewer.action(ID, 10, 'token-a', 1, { type: 'viewport', width: 800, height: 600 }).catch((err) => err);
+    await h.viewer.action(ID, 10, 'token-a', 1, { type: 'visibility', visible: false });
+    await resize;
+    expect(h.run).not.toHaveBeenCalled();
+    h.viewer.input(ID, 10, 'token-a', 1, key);
+    h.events.length = 0;
+    for (let seq = 1; seq <= 100; seq++) h.receive({ ...protocol.frame, seq });
+    expect(h.events).toHaveLength(0);
+    h.receive(protocol.url);
+    expect(h.events.at(-1)?.message.type).toBe('url');
+    await h.viewer.action(ID, 10, 'token-a', 1, { type: 'reload' });
+    expect(h.run).toHaveBeenCalledOnce();
+    await h.viewer.action(ID, 10, 'token-a', 1, { type: 'visibility', visible: true });
+    expect(h.events.at(-1)?.message).toMatchObject({ type: 'frame', id: 102 });
+    await expect(h.viewer.action(ID, 10, 'token-a', 1, { type: 'paste' })).rejects.toThrow('frame');
+    h.viewer.ack(ID, 10, 'token-a', 102, true);
+    await h.viewer.input(ID, 10, 'token-a', 1, key);
+    expect(JSON.parse(h.sockets[0].send.mock.calls.at(-1)![0])).toEqual(key);
+  });
+
+  it('redelivers an acknowledged static current-tab frame on repeated returns without native repaint', async () => {
+    const h = harness();
+    h.present();
+    for (let id = 2; id <= 4; id++) {
+      await h.viewer.action(ID, 10, 'token-a', 1, { type: 'visibility', visible: false });
+      await h.viewer.action(ID, 10, 'token-a', 1, { type: 'visibility', visible: true });
+      expect(h.events.at(-1)?.message).toEqual({ type: 'frame', id, data: protocol.frame.data, width: 900, height: 640 });
+      await h.viewer.action(ID, 10, 'token-a', 1, { type: 'viewport', width: 900, height: 640 });
+      await expect(h.viewer.action(ID, 10, 'token-a', 1, { type: 'paste' })).rejects.toThrow('frame');
+      h.viewer.ack(ID, 10, 'token-a', id, true);
+      await h.viewer.action(ID, 10, 'token-a', 1, { type: 'paste' });
+    }
+    expect(h.run.mock.calls.map((call) => call[1][0])).toEqual(['set', 'eval', 'set', 'eval', 'set', 'eval']);
+  });
+
+  it('bounds repeated visibility replays behind an old in-flight decode and requires a fresh draw ack', async () => {
+    const h = harness();
+    h.receive(protocol.frame);
+    for (let id = 2; id <= 4; id++) {
+      await h.viewer.action(ID, 10, 'token-a', 1, { type: 'visibility', visible: false });
+      await h.viewer.action(ID, 10, 'token-a', 1, { type: 'visibility', visible: true });
+      expect(h.events.filter((event) => event.message.type === 'frame')).toHaveLength(1);
+    }
+    h.viewer.ack(ID, 10, 'token-a', 1, true);
+    expect(h.events.at(-1)?.message).toMatchObject({ type: 'frame', id: 4 });
+    await expect(h.viewer.action(ID, 10, 'token-a', 1, { type: 'paste' })).rejects.toThrow('frame');
+    h.viewer.ack(ID, 10, 'old-token', 4, true);
+    await expect(h.viewer.action(ID, 10, 'token-a', 1, { type: 'paste' })).rejects.toThrow('frame');
+    h.viewer.ack(ID, 10, 'token-a', 4, true);
+    await h.viewer.action(ID, 10, 'token-a', 1, { type: 'paste' });
+    expect(h.events.filter((event) => event.message.type === 'frame')).toHaveLength(2);
+  });
+
+  it('does not replay a cached frame after the active tab changes while hidden', async () => {
+    const h = harness();
+    h.present();
+    await h.viewer.action(ID, 10, 'token-a', 1, { type: 'visibility', visible: false });
+    h.receive({ type: 'tabs', tabs: [{ ...protocol.tabs.tabs[0], tabId: 't9' }] });
+    await h.viewer.action(ID, 10, 'token-a', 2, { type: 'visibility', visible: true });
+    expect(h.events.at(-1)?.message.type).toBe('tabs');
+    await expect(h.viewer.action(ID, 10, 'token-a', 2, { type: 'paste' })).rejects.toThrow('frame');
+    h.present();
+    await h.viewer.action(ID, 10, 'token-a', 2, { type: 'paste' });
+  });
+
+  it.each(['failed-original', 'success-drawn', 'success-inflight', 'success-pending'])('preserves authoritative frame state through tab command completion: %s', async (mode) => {
+    const h = harness();
+    const tabs = [protocol.tabs.tabs[0], { ...protocol.tabs.tabs[0], tabId: 't9', active: false }];
+    h.receive({ type: 'tabs', tabs });
+    h.present();
+    let finish!: (result: typeof ok) => void;
+    h.run.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const select = h.viewer.action(ID, 10, 'token-a', 1, { type: 'tab-select', tabId: 't9' }).catch((err) => err);
+    await vi.waitFor(() => expect(finish).toBeTypeOf('function'));
+    const revision = mode === 'failed-original' ? 1 : 2;
+    if (mode !== 'failed-original') {
+      h.receive({ type: 'tabs', tabs: tabs.map((tab) => ({ ...tab, active: tab.tabId === 't9' })) });
+      if (mode === 'success-drawn') h.present();
+      else h.receive(protocol.frame);
+      if (mode === 'success-pending') h.receive({ ...protocol.frame, data: 'BBBB' });
+    }
+    finish(mode === 'failed-original' ? { ...ok, ok: false, stderr: 'Tab is locked' } : ok);
+    const result = await select;
+    if (mode === 'failed-original') expect(result).toBeInstanceOf(Error);
+    else expect(result).toBeUndefined();
+    if (mode === 'success-inflight' || mode === 'success-pending') h.viewer.ack(ID, 10, 'token-a', 2, true);
+    if (mode === 'success-pending') {
+      expect(h.events.at(-1)?.message).toMatchObject({ type: 'frame', id: 3, data: 'BBBB' });
+      h.viewer.ack(ID, 10, 'token-a', 3, true);
+    }
+    await h.viewer.input(ID, 10, 'token-a', revision, key);
+    expect(JSON.parse(h.sockets[0].send.mock.calls.at(-1)![0])).toEqual(key);
+    await h.viewer.action(ID, 10, 'token-a', revision, { type: 'paste' });
+    await h.viewer.action(ID, 10, 'token-a', revision, { type: 'visibility', visible: false });
+    await h.viewer.action(ID, 10, 'token-a', revision, { type: 'visibility', visible: true });
+    expect(h.events.at(-1)?.message).toMatchObject({ type: 'frame', data: mode === 'success-pending' ? 'BBBB' : protocol.frame.data });
+  });
+
+  it('selects stable IDs rather than visual indices and accepts its own early stream update', async () => {
+    const h = harness();
+    const tabs = [protocol.tabs.tabs[0], { ...protocol.tabs.tabs[0], tabId: 't9', active: false }];
+    h.receive({ type: 'tabs', tabs });
+    h.run.mockImplementationOnce(async () => {
+      h.receive({ type: 'tabs', tabs: tabs.map((tab) => ({ ...tab, active: tab.tabId === 't9' })) });
+      return ok;
+    });
+    await h.viewer.action(ID, 10, 'token-a', 1, { type: 'tab-select', tabId: 't9' });
+    expect(h.run.mock.calls[0][1]).toEqual(['tab', 't9']);
+    await expect(h.viewer.action(ID, 10, 'token-a', 2, { type: 'tab-select', tabId: '1' })).rejects.toThrow('Invalid');
+    await expect(h.viewer.action(ID, 10, 'token-a', 2, { type: 'tab-close', tabId: 't88' })).rejects.toThrow('no longer');
+  });
+
+  it.each(['active', 'inactive', 'last'])('closes the original stable ID safely: %s tab', async (mode) => {
+    const h = harness();
+    const tabs = mode === 'last' ? protocol.tabs.tabs : [protocol.tabs.tabs[0], { ...protocol.tabs.tabs[0], tabId: 't9', active: false }];
+    h.receive({ type: 'tabs', tabs });
+    let current = tabs;
+    h.run.mockImplementation(async (_session, argv) => {
+      if (argv[1] === 'new') current = [...current.map((tab) => ({ ...tab, active: false })), { ...tabs[0], tabId: 't12', active: true, url: 'about:blank' }];
+      else if (argv[1] === 'close') current = current.filter((tab) => tab.tabId !== argv[2]);
+      else current = current.map((tab) => ({ ...tab, active: tab.tabId === argv[1] }));
+      h.receive({ type: 'tabs', tabs: current });
+      return { ...ok, data: { tabId: 't12' } } as typeof ok;
+    });
+    await h.viewer.action(ID, 10, 'token-a', 1, { type: 'tab-close', tabId: mode === 'inactive' ? 't9' : 't1' });
+    expect(h.run.mock.calls.map((call) => call[1])).toEqual(mode === 'inactive' ? [['tab', 'close', 't9']]
+      : mode === 'last' ? [['tab', 'new', 'about:blank'], ['tab', 'close', 't1']]
+      : [['tab', 't9'], ['tab', 'close', 't1']]);
+    expect(h.viewer.canAct(ID)).toBe(true);
+  });
+
+  it.each(['creation', 'close'])('retains authoritative available tabs after last-close %s failure', async (failure) => {
+    const h = harness();
+    const both = [ { ...protocol.tabs.tabs[0], active: false }, { ...protocol.tabs.tabs[0], tabId: 't9', active: true, url: 'about:blank' } ];
+    h.run.mockImplementation(async (_session, argv) => {
+      if (argv[1] === 'new' && failure !== 'creation') {
+        h.receive({ type: 'tabs', tabs: both });
+        return { ...ok, data: { tabId: 't9' } } as typeof ok;
+      }
+      return { ...ok, ok: false, stderr: `${failure} failed` };
+    });
+    await expect(h.viewer.action(ID, 10, 'token-a', 1, { type: 'tab-close', tabId: 't1' })).rejects.toThrow(`${failure} failed`);
+    expect(h.run).toHaveBeenCalledTimes(failure === 'creation' ? 1 : 2);
+    expect(h.events.at(-1)?.message).toEqual({ type: 'tabs', tabs: (failure === 'creation' ? protocol.tabs.tabs : both)
+      .map(({ tabId, title, url, active }) => ({ tabId, title, url, active })) });
+    expect(h.viewer.canAct(ID)).toBe(true);
+  });
+
+  it.each(['external-active', 'external-membership', 'detach', 'session'])('stops a dependent close after %s changes during selection', async (change) => {
+    const h = harness();
+    const tabs = [protocol.tabs.tabs[0], { ...protocol.tabs.tabs[0], tabId: 't9', active: false }];
+    h.receive({ type: 'tabs', tabs });
+    h.run.mockImplementationOnce(async () => {
+      h.receive({ type: 'tabs', tabs: tabs.map((tab) => ({ ...tab, active: tab.tabId === 't9' })) });
+      if (change === 'external-active') h.receive({ type: 'tabs', tabs });
+      if (change === 'external-membership') h.receive({ type: 'tabs', tabs: [tabs[1]] });
+      if (change === 'detach') h.viewer.detach(ID, 10, 'token-a');
+      if (change === 'session') h.replaceSession();
+      return ok;
+    });
+    await expect(h.viewer.action(ID, 10, 'token-a', 1, { type: 'tab-close', tabId: 't1' })).rejects.toThrow('Tabs changed');
+    expect(h.run).toHaveBeenCalledOnce();
+  });
+
+  it('drops input queued before or received during a tab change even when its stream update is late', async () => {
+    const h = harness();
+    h.receive({ type: 'tabs', tabs: [protocol.tabs.tabs[0], { ...protocol.tabs.tabs[0], tabId: 't9', active: false }] });
+    h.present();
+    let finish!: (result: typeof ok) => void;
+    h.run.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const select = h.viewer.action(ID, 10, 'token-a', 1, { type: 'tab-select', tabId: 't9' });
+    const queued = h.viewer.input(ID, 10, 'token-a', 1, key);
+    await vi.waitFor(() => expect(finish).toBeTypeOf('function'));
+    h.viewer.input(ID, 10, 'token-a', 1, key);
+    await expect(h.viewer.action(ID, 10, 'token-a', 1, { type: 'paste' })).rejects.toThrow('frame');
+    finish(ok);
+    await Promise.all([select, queued]);
+    h.viewer.input(ID, 10, 'token-a', 1, key);
+    expect(h.sockets[0].send).not.toHaveBeenCalled();
+    const delivered = h.events.length;
+    await h.viewer.action(ID, 10, 'token-a', 1, { type: 'visibility', visible: false });
+    await h.viewer.action(ID, 10, 'token-a', 1, { type: 'visibility', visible: true });
+    expect(h.events).toHaveLength(delivered);
+    h.present();
+    await h.viewer.input(ID, 10, 'token-a', 1, key);
+    expect(JSON.parse(h.sockets[0].send.mock.calls.at(-1)![0])).toEqual(key);
+  });
+
+  it('does not close the active original when selection fails', async () => {
+    const h = harness();
+    h.receive({ type: 'tabs', tabs: [protocol.tabs.tabs[0], { ...protocol.tabs.tabs[0], tabId: 't9', active: false }] });
+    h.run.mockResolvedValueOnce({ ...ok, ok: false, stderr: 'Tab is locked' });
+    await expect(h.viewer.action(ID, 10, 'token-a', 1, { type: 'tab-close', tabId: 't1' })).rejects.toThrow('locked');
+    expect(h.run.mock.calls.map((call) => call[1])).toEqual([['tab', 't9']]);
+    expect(h.viewer.canAct(ID)).toBe(true);
+  });
+
+  it('continues a last-close when the expected tab update arrives after creation completion', async () => {
+    const h = harness();
+    h.run.mockResolvedValueOnce({ ...ok, data: { tabId: 't9' } } as typeof ok).mockImplementationOnce(async () => {
+      h.receive({ type: 'tabs', tabs: [{ ...protocol.tabs.tabs[0], active: false }, { ...protocol.tabs.tabs[0], tabId: 't9', active: true }] });
+      h.receive({ type: 'tabs', tabs: [{ ...protocol.tabs.tabs[0], tabId: 't9', active: true }] });
+      return ok;
+    });
+    await h.viewer.action(ID, 10, 'token-a', 1, { type: 'tab-close', tabId: 't1' });
+    expect(h.run.mock.calls.map((call) => call[1])).toEqual([['tab', 'new', 'about:blank'], ['tab', 'close', 't1']]);
+  });
+
   it('validates finite mouse/key messages and strips arbitrary CDP/argv fields', () => {
     expect(validatedViewerInput({ ...key, method: 'Browser.close', argv: ['close'] })).toEqual(key);
     expect(validatedViewerInput({ ...key, modifiers: 32 })).toBeNull();

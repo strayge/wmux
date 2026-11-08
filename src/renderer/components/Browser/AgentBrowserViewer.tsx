@@ -1,8 +1,13 @@
-import { useEffect, useRef, useState } from 'react';
-import type { AgentViewerAction, AgentViewerBridge, AgentViewerEvent, AgentViewerInput } from '../../../shared/types';
+import { useEffect, useImperativeHandle, useRef, useState, type Ref } from 'react';
+import type { AgentBrowserTab, AgentViewerAction, AgentViewerBridge, AgentViewerEvent, AgentViewerInput } from '../../../shared/types';
 import { useStore } from '../../store';
 import { guestShortcutAction } from '../../hooks/useKeyboardShortcuts';
 import { matchIndexShortcut } from '../../utils/index-shortcuts';
+import { useT } from '../../i18n';
+
+export interface AgentViewerHandle {
+  action: (action: AgentViewerAction) => Promise<void>;
+}
 
 interface Props {
   surfaceId: string;
@@ -10,6 +15,10 @@ interface Props {
   focused?: boolean;
   onActivate?: () => void;
   onPageState: (url: string, title?: string) => void;
+  onTabs?: (tabs: AgentBrowserTab[]) => void;
+  onConnection?: (connected: boolean) => void;
+  onDashboard?: () => void;
+  ref?: Ref<AgentViewerHandle>;
 }
 
 export function viewerCoordinates(clientX: number, clientY: number,
@@ -24,13 +33,18 @@ export function viewerModifiers(e: { altKey: boolean; ctrlKey: boolean; metaKey:
 }
 
 /** Textarea supplies a real IME target; committed composition is sent exactly once. */
-export default function AgentBrowserViewer({ surfaceId, visible, focused, onActivate, onPageState }: Props) {
+export default function AgentBrowserViewer({ surfaceId, visible, focused, onActivate, onPageState, onTabs, onConnection, onDashboard, ref }: Props) {
+  const t = useT();
   const area = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
   const keyboard = useRef<HTMLTextAreaElement>(null);
   const state = useRef({ token: '', revision: 0, ready: false, drawnRevision: -1, width: 1, height: 1 });
-  const callbacks = useRef({ onPageState, onActivate });
-  callbacks.current = { onPageState, onActivate };
+  const callbacks = useRef({ onPageState, onActivate, onTabs, onConnection });
+  callbacks.current = { onPageState, onActivate, onTabs, onConnection };
+  const isVisible = useRef(visible);
+  isVisible.current = visible;
+  const visibilityChanged = useRef<() => void>(() => {});
+  const visibilityGeneration = useRef(0);
   const [error, setError] = useState('');
   const [connected, setConnected] = useState(false);
   const [hasFrame, setHasFrame] = useState(false);
@@ -46,16 +60,32 @@ export default function AgentBrowserViewer({ surfaceId, visible, focused, onActi
   }, []);
 
   useEffect(() => {
-    if (focused === false) keyboard.current?.blur();
-  }, [focused]);
+    if (focused === false || !visible) keyboard.current?.blur();
+  }, [focused, visible]);
+
+  useEffect(() => { visibilityChanged.current(); }, [visible]);
+
+  useImperativeHandle(ref, () => ({
+    action: async (value) => {
+      const { token, revision, ready } = state.current;
+      if (!ready) throw new Error('Page is not connected');
+      try {
+        await (window.wmux.agentViewer as AgentViewerBridge).action(surfaceId, token, revision, value);
+        if (state.current.token === token && state.current.ready) setError('');
+      } catch (err) {
+        if (state.current.token === token && state.current.ready) setError(String(err));
+        throw err;
+      }
+    },
+  }), [surfaceId]);
 
   useEffect(() => {
-    if (!visible) return;
     const api = window.wmux.agentViewer as AgentViewerBridge;
     const token = crypto.randomUUID();
     state.current = { token, revision: 0, ready: false, drawnRevision: -1, width: 1, height: 1 };
     setError('');
     setConnected(false);
+    callbacks.current.onConnection?.(false);
     setHasFrame(false);
     let disposed = false;
     let resizeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -64,20 +94,21 @@ export default function AgentBrowserViewer({ surfaceId, visible, focused, onActi
     let lastSize = '';
     let activeTab: string | undefined;
     const resize = async () => {
-      if (resizing || !state.current.ready || disposed) return;
+      if (resizing || !state.current.ready || disposed || !isVisible.current || document.hidden) return;
       resizing = true;
       try {
-        while (pendingSize && !disposed && state.current.ready) {
+        while (pendingSize && !disposed && state.current.ready && isVisible.current && !document.hidden) {
           const { width, height, revision } = pendingSize;
           pendingSize = undefined;
           if (revision !== state.current.revision) continue;
-          const key = `${revision}:${width}x${height}`;
+          const generation = visibilityGeneration.current;
+          const key = `${generation}:${revision}:${width}x${height}`;
           if (key === lastSize) continue;
           try {
             await api.action(surfaceId, token, revision, { type: 'viewport', width, height });
-            if (!disposed && revision === state.current.revision) lastSize = key;
+            if (!disposed && revision === state.current.revision && generation === visibilityGeneration.current) lastSize = key;
           } catch (err) {
-            if (!disposed && revision === state.current.revision) {
+            if (!disposed && revision === state.current.revision && generation === visibilityGeneration.current) {
               setError(String(err));
               pendingSize = undefined;
               break;
@@ -89,7 +120,7 @@ export default function AgentBrowserViewer({ surfaceId, visible, focused, onActi
     };
     const measure = () => {
       const el = area.current;
-      if (!el || disposed || document.hidden) return;
+      if (!el || disposed || document.hidden || !isVisible.current) return;
       const rect = el.getBoundingClientRect();
       const width = Math.floor(rect.width), height = Math.floor(rect.height);
       if (width < 1 || height < 1) return;
@@ -97,6 +128,18 @@ export default function AgentBrowserViewer({ surfaceId, visible, focused, onActi
       clearTimeout(resizeTimer);
       resizeTimer = setTimeout(() => { void resize(); }, 120);
     };
+    const syncVisibility = () => {
+      const shown = isVisible.current && !document.hidden;
+      visibilityGeneration.current++;
+      state.current.drawnRevision = -1;
+      setHasFrame(false);
+      pendingSize = undefined;
+      lastSize = '';
+      clearTimeout(resizeTimer);
+      void api.action(surfaceId, token, state.current.revision, { type: 'visibility', visible: shown }).catch(() => {});
+      if (shown) measure();
+    };
+    visibilityChanged.current = syncVisibility;
     const off = api.onEvent((event: AgentViewerEvent) => {
       if (disposed || event.surfaceId !== surfaceId || event.token !== token) return;
       const { message } = event;
@@ -113,14 +156,17 @@ export default function AgentBrowserViewer({ surfaceId, visible, focused, onActi
           pendingSize = undefined;
           setError(message.message);
           setConnected(false);
+          callbacks.current.onConnection?.(false);
           break;
         case 'status':
           state.current.ready = message.connected;
           setConnected(message.connected);
+          callbacks.current.onConnection?.(message.connected);
           measure();
           break;
         case 'url': callbacks.current.onPageState(message.url); break;
         case 'tabs': {
+          callbacks.current.onTabs?.(message.tabs);
           const active = message.tabs.find((tab) => tab.active);
           if (active) callbacks.current.onPageState(active.url, active.title);
           if (active?.tabId !== activeTab) {
@@ -131,14 +177,19 @@ export default function AgentBrowserViewer({ surfaceId, visible, focused, onActi
           break;
         }
         case 'frame': {
+          if (!isVisible.current || document.hidden) {
+            api.ack(surfaceId, token, message.id, false);
+            break;
+          }
           const revision = event.revision;
+          const generation = visibilityGeneration.current;
           const image = new Image();
           const finish = (drawn: boolean) => api.ack(surfaceId, token, message.id, drawn);
           image.onload = () => {
             let drawn = false;
             try {
               const el = canvas.current;
-              if (!disposed && state.current.ready && state.current.revision === revision && el) {
+              if (!disposed && isVisible.current && !document.hidden && generation === visibilityGeneration.current && state.current.ready && state.current.revision === revision && el) {
                 el.width = image.naturalWidth;
                 el.height = image.naturalHeight;
                 const context = el.getContext('2d');
@@ -154,8 +205,10 @@ export default function AgentBrowserViewer({ surfaceId, visible, focused, onActi
             } finally { finish(drawn); }
           };
           image.onerror = () => {
-            if (!disposed && state.current.revision === revision) {
+            if (!disposed && isVisible.current && generation === visibilityGeneration.current && state.current.revision === revision) {
               state.current.ready = false;
+              setConnected(false);
+              callbacks.current.onConnection?.(false);
               setError('Could not decode the page stream. Open Dashboard to continue.');
             }
             finish(false);
@@ -165,32 +218,35 @@ export default function AgentBrowserViewer({ surfaceId, visible, focused, onActi
         }
       }
     });
-    void api.attach(surfaceId, token).catch((err) => { if (!disposed) setError(String(err)); });
+    void api.attach(surfaceId, token).then(() => { if (!disposed && (!isVisible.current || document.hidden)) syncVisibility(); })
+      .catch((err) => { if (!disposed) setError(String(err)); });
     const observer = new ResizeObserver(measure);
     if (area.current) observer.observe(area.current);
-    document.addEventListener('visibilitychange', measure);
+    document.addEventListener('visibilitychange', syncVisibility);
     return () => {
       disposed = true;
       state.current.ready = false;
       pendingSize = undefined;
       clearTimeout(resizeTimer);
       observer.disconnect();
-      document.removeEventListener('visibilitychange', measure);
+      document.removeEventListener('visibilitychange', syncVisibility);
+      visibilityChanged.current = () => {};
       off();
       api.detach(surfaceId, token);
     };
-  }, [surfaceId, visible]);
+  }, [surfaceId]);
 
   const input = (value: AgentViewerInput) => {
     const s = state.current;
-    if (visible && s.ready && s.drawnRevision === s.revision) window.wmux.agentViewer.input(surfaceId, s.token, s.revision, value);
+    if (visible && !document.hidden && s.ready && s.drawnRevision === s.revision) window.wmux.agentViewer.input(surfaceId, s.token, s.revision, value);
   };
   const action = (value: AgentViewerAction) => {
     const s = state.current;
-    if (visible && s.ready && s.drawnRevision === s.revision) {
+    if (visible && !document.hidden && s.ready && s.drawnRevision === s.revision) {
       const { token, revision } = s;
+      const generation = visibilityGeneration.current;
       void (window.wmux.agentViewer as AgentViewerBridge).action(surfaceId, token, revision, value).catch((err) => {
-        if (state.current.token === token && state.current.revision === revision) setError(String(err));
+        if (state.current.token === token && state.current.ready && state.current.revision === revision && generation === visibilityGeneration.current) setError(String(err));
       });
     }
   };
@@ -236,7 +292,7 @@ export default function AgentBrowserViewer({ surfaceId, visible, focused, onActi
       ...(eventType === 'keyDown' && e.key === 'Enter' ? { text: '\r' } : {}) });
   };
 
-  return <div ref={area} className="agent-browser-viewer" style={{ position: 'absolute', inset: 0, overflow: 'hidden' }}>
+  return <div ref={area} className="agent-browser-viewer" style={{ position: 'absolute', inset: 0, overflow: 'hidden', visibility: visible ? 'visible' : 'hidden' }}>
     <canvas ref={canvas} style={{ width: '100%', height: '100%', objectFit: 'fill', touchAction: 'none' }}
       onPointerDown={(e) => { callbacks.current.onActivate?.(); keyboard.current?.focus({ preventScroll: true }); e.currentTarget.setPointerCapture(e.pointerId); mouse(e, 'mousePressed'); e.preventDefault(); }}
       onPointerMove={(e) => mouse(e, 'mouseMoved')}
@@ -267,9 +323,16 @@ export default function AgentBrowserViewer({ surfaceId, visible, focused, onActi
       }}
       onPaste={(e) => { e.preventDefault(); action({ type: 'paste' }); }}
       onCopy={(e) => { e.preventDefault(); action({ type: 'copy' }); }} />
-    {(!connected || !hasFrame || error) && <div className="browser-pane__blank" role="status" style={{ pointerEvents: 'none' }}>
-      <p>{error || (connected ? 'Waiting for page frame…' : 'Connecting to page…')}</p>
-      {error && <p>Open Dashboard to continue.</p>}
+    {(!connected || !hasFrame || error) && <div className="browser-pane__blank agent-browser-viewer__overlay" role="status">
+      <p className="browser-pane__blank-title">{error || (connected
+        ? t('browser.agent.waitingFrame', 'Waiting for page frame…')
+        : t('browser.agent.connecting', 'Connecting to page…'))}</p>
+      {error && onDashboard && <button className="browser-pane__setup-btn" onClick={onDashboard}>
+        {t('browser.agent.showDashboard', 'Show dashboard')}
+      </button>}
+      {error && connected && <button className="browser-pane__setup-btn" onClick={() => setError('')}>
+        {t('browser.agent.dismissError', 'Dismiss')}
+      </button>}
     </div>}
   </div>;
 }

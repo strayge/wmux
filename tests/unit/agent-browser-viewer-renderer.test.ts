@@ -66,7 +66,7 @@ const dispatchKey = async (type: string, key: string, code: string, keyCode: num
 };
 
 describe('renderer stream/input bridge', () => {
-  it('acknowledges draw/drop and ignores a decode completing after detach', async () => {
+  it('acknowledges draw/drop and ignores decodes completing after hiding or detach', async () => {
     await render();
     await event({ type: 'status', connected: true, width: 900, height: 640 });
     await event({ type: 'frame', id: 1, data: 'AAAA', width: 900, height: 640 });
@@ -79,7 +79,16 @@ describe('renderer stream/input bridge', () => {
     await act(async () => decode[1].onload?.(new Event('load')));
     expect(draw).toHaveBeenCalledOnce();
     expect(api.ack).toHaveBeenLastCalledWith('surf-renderer', expect.any(String), 2, false);
+    expect(api.detach).not.toHaveBeenCalled();
+    expect(api.action).toHaveBeenLastCalledWith('surf-renderer', expect.any(String), 1, { type: 'visibility', visible: false });
+    expect(api.attach).toHaveBeenCalledOnce();
+    await render(true);
+    await event({ type: 'frame', id: 3, data: 'AAAA', width: 900, height: 640 });
+    await act(async () => root.render(null));
+    await act(async () => decode[2].onload?.(new Event('load')));
+    expect(draw).toHaveBeenCalledOnce();
     expect(api.detach).toHaveBeenCalledOnce();
+    expect(api.ack).toHaveBeenLastCalledWith('surf-renderer', expect.any(String), 3, false);
   });
 
   it('sends Unicode once and avoids duplicating committed composition', async () => {
@@ -120,7 +129,7 @@ describe('renderer stream/input bridge', () => {
     } finally { document.removeEventListener('keydown', bubbled); }
   });
 
-  it('blocks key/text/pointer/clipboard until the current revision is actually drawn, including reattach', async () => {
+  it('blocks key/text/pointer/clipboard until the current revision is actually drawn, including return from hiding', async () => {
     vi.useFakeTimers();
     await render();
     await event({ type: 'status', connected: true, width: 900, height: 640 });
@@ -196,7 +205,66 @@ describe('renderer stream/input bridge', () => {
     await render(false);
     width = 600; height = 400; measure();
     await act(async () => vi.advanceTimersByTimeAsync(150));
-    expect(api.action).not.toHaveBeenCalled();
+    expect(vi.mocked(api.action).mock.calls.map((call) => call[3])).toEqual([{ type: 'visibility', visible: false }]);
+    await render(true);
+    await act(async () => vi.advanceTimersByTimeAsync(150));
+    expect(api.action).toHaveBeenLastCalledWith('surf-renderer', expect.any(String), 2, { type: 'viewport', width: 600, height: 400 });
+    expect(api.attach).toHaveBeenCalledOnce();
+    expect(api.detach).not.toHaveBeenCalled();
+  });
+
+  it('keeps tab/URL/connection updates while hidden and drops frames without decoding', async () => {
+    const onPageState = vi.fn(), onTabs = vi.fn(), onConnection = vi.fn();
+    await act(async () => root.render(createElement(AgentBrowserViewer, { surfaceId: 'surf-renderer', visible: false, onPageState, onTabs, onConnection })));
+    await event({ type: 'status', connected: true, width: 900, height: 640 });
+    const tabs = [{ tabId: 't9', title: 'Blank', url: 'about:blank', active: true }];
+    await event({ type: 'tabs', tabs }, 2);
+    await event({ type: 'frame', id: 4, data: 'AAAA', width: 900, height: 640 }, 2);
+    expect(decode).toHaveLength(0);
+    expect(api.ack).toHaveBeenLastCalledWith('surf-renderer', expect.any(String), 4, false);
+    expect(onPageState).toHaveBeenCalledWith('about:blank', 'Blank');
+    expect(onTabs).toHaveBeenCalledWith(tabs);
+    expect(onConnection).toHaveBeenLastCalledWith(true);
+    expect(api.attach).toHaveBeenCalledOnce();
+  });
+
+  it('draws the bridge cache and restores paste on repeated static-page returns without viewport repaint', async () => {
+    vi.useFakeTimers();
+    await render();
+    await event({ type: 'status', connected: true, width: 900, height: 640 });
+    await present();
+    await act(async () => vi.advanceTimersByTimeAsync(150));
+    let id = 1;
+    vi.mocked(api.action).mockImplementation(async (surfaceId, token, revision, action) => {
+      if (action.type === 'visibility' && action.visible) {
+        onEvent({ surfaceId, token, revision, message: { type: 'frame', id: ++id, data: 'AAAA', width: 900, height: 640 } });
+      }
+    });
+    for (let count = 0; count < 3; count++) {
+      await render(false);
+      await render(true);
+      await dispatchKey('keydown', 'v', 'KeyV', 86, true);
+      expect(vi.mocked(api.action).mock.calls.filter((call) => call[3].type === 'paste')).toHaveLength(count);
+      await act(async () => decode.at(-1)!.onload?.(new Event('load')));
+      await act(async () => vi.advanceTimersByTimeAsync(150));
+      expect(container.textContent).not.toContain('Waiting for page frame');
+      expect(api.ack).toHaveBeenLastCalledWith('surf-renderer', expect.any(String), id, true);
+      await dispatchKey('keydown', 'v', 'KeyV', 86, true);
+      expect(api.action).toHaveBeenLastCalledWith('surf-renderer', expect.any(String), 1, { type: 'paste' });
+    }
+    expect(api.attach).toHaveBeenCalledOnce();
+    expect(draw).toHaveBeenCalledTimes(4);
+  });
+
+  it('does not draw an old decode after a hide/return round trip', async () => {
+    await render();
+    await event({ type: 'status', connected: true, width: 900, height: 640 });
+    await event({ type: 'frame', id: 1, data: 'AAAA', width: 900, height: 640 });
+    await render(false);
+    await render(true);
+    await act(async () => decode[0].onload?.(new Event('load')));
+    expect(draw).not.toHaveBeenCalled();
+    expect(api.ack).toHaveBeenLastCalledWith('surf-renderer', expect.any(String), 1, false);
   });
 
   it('forwards pointer drag/release and cancels host wheel scrolling', async () => {

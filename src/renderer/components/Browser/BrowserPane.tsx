@@ -2,9 +2,9 @@ import { useState, useRef, useCallback, useEffect, type CSSProperties } from 're
 import AddressBar from './AddressBar';
 import { useT } from '../../i18n';
 import AgentBrowserSetup from './AgentBrowserSetup';
-import AgentBrowserViewer from './AgentBrowserViewer';
+import AgentBrowserViewer, { type AgentViewerHandle } from './AgentBrowserViewer';
 import { popupBridgeSource } from './popup-bridge';
-import type { BrowserEngine } from '../../../shared/types';
+import type { AgentBrowserTab, AgentViewerAction, BrowserEngine } from '../../../shared/types';
 import { BROWSER_BLANK_PAGE } from '../../utils/browser-start-page';
 import { useKeepRendering } from '../../utils/browser-keep-rendering';
 import { openInNewBrowserTab } from '../../utils/open-in-browser';
@@ -263,6 +263,10 @@ export default function BrowserPane({
   const [presentation, setPresentation] = useState<'page' | 'dashboard'>('page');
   const [dashboardAvailable, setDashboardAvailable] = useState(false);
   const dashboardUrlRef = useRef<string | null>(null);
+  const viewerRef = useRef<AgentViewerHandle>(null);
+  const [agentTabs, setAgentTabs] = useState<AgentBrowserTab[]>([]);
+  const [agentConnected, setAgentConnected] = useState(false);
+  const [focusAddress, setFocusAddress] = useState(0);
 
   // Mirrors read from webview event listeners and from callbacks that are
   // deliberately dependency-free (they are handed to a memoised child and to
@@ -299,16 +303,10 @@ export default function BrowserPane({
     };
   }, []);
 
-  /** Navigation never falls back to startup or bypasses a paused viewer. */
-  const openInAgent = useCallback(async (url: string) => {
-    setAgentUrl(url);
-    const api = window.wmux?.agentBrowser;
-    try {
-      await api?.open?.(surfaceId, url);
-    } catch {
-      /* The stream owns recovery; navigation must not re-enable a failed session. */
-    }
-  }, [surfaceId]);
+  /** Toolbar commands never address the dashboard guest or start a session. */
+  const agentAction = useCallback((action: AgentViewerAction) => {
+    return viewerRef.current?.action(action) ?? Promise.reject(new Error('Page is not connected'));
+  }, []);
 
   const navigate = useCallback((newUrl: string) => {
     const resolved = resolveInputUrl(newUrl);
@@ -316,7 +314,7 @@ export default function BrowserPane({
     // stays on the dashboard; navigating it would throw away the viewer the
     // user just asked to watch.
     if (engineRef.current === 'agent') {
-      openInAgent(resolved).catch(() => {});
+      void agentAction({ type: 'navigate', url: resolved }).catch(() => {});
       return;
     }
     // Single navigation. loadURL can still reject with ERR_ABORTED for genuine
@@ -324,30 +322,20 @@ export default function BrowserPane({
     // mid-load); those are reflected by the did-*-load handlers below, so
     // swallow the promise rejection rather than leaving it unhandled.
     webviewRef.current?.loadURL(resolved).catch(() => {});
-  }, [openInAgent]);
+  }, [agentAction]);
 
-  // Back/forward/reload in agent mode.
-  //
-  // The webview is showing agent-browser's dashboard SPA, and the remote page's
-  // history belongs to a Chrome this pane cannot reach (there is no renderer
-  // IPC for arbitrary agent-browser verbs — those go through the CLI/pipe).
-  // So:
-  //   • back/forward are DISABLED — canGoBack/canGoForward are forced false in
-  //     agent mode, and the handlers refuse as well so a stale enabled button
-  //     can't walk the user off the viewer. Silently walking the dashboard's
-  //     own SPA history is the one behaviour that is definitely wrong.
-  //   • reload reloads the VIEWER. That is the honest reading of the button in
-  //     agent mode ("the feed looks stuck") and it is the only recovery gesture
-  //     available from here; the address bar covers "go somewhere else".
   const goBack = useCallback(() => {
-    if (engineRef.current === 'agent') return;
+    if (engineRef.current === 'agent') { void agentAction({ type: 'back' }).catch(() => {}); return; }
     webviewRef.current?.goBack();
-  }, []);
+  }, [agentAction]);
   const goForward = useCallback(() => {
-    if (engineRef.current === 'agent') return;
+    if (engineRef.current === 'agent') { void agentAction({ type: 'forward' }).catch(() => {}); return; }
     webviewRef.current?.goForward();
-  }, []);
-  const reload = useCallback(() => webviewRef.current?.reload(), []);
+  }, [agentAction]);
+  const reload = useCallback(() => {
+    if (engineRef.current === 'agent') { void agentAction({ type: 'reload' }).catch(() => {}); return; }
+    webviewRef.current?.reload();
+  }, [agentAction]);
   useEffect(() => {
     const onRefresh = (event: Event) => {
       const id = (event as CustomEvent<{ surfaceId?: string }>).detail?.surfaceId;
@@ -595,6 +583,8 @@ export default function BrowserPane({
     const stale = () => !mountedRef.current || switchSeqRef.current !== seq;
     const api = window.wmux?.agentBrowser;
     setAgentStatus('starting');
+    setAgentConnected(false);
+    setAgentTabs([]);
     setAgentError('');
     setAgentUrl(url);
     if (!api) { setAgentStatus('setup'); return; }
@@ -685,6 +675,23 @@ export default function BrowserPane({
     return () => window.removeEventListener('wmux:browser-navigate', handler);
   }, [navigate, surfaceId]);
 
+  const showDashboard = useCallback(() => {
+    setPresentation('dashboard');
+    void window.wmux.agentBrowser.status().then((status: { dashboardAvailable: boolean }) => {
+      if (!mountedRef.current || engineRef.current !== 'agent') return;
+      setDashboardAvailable(status.dashboardAvailable);
+      const url = dashboardUrlRef.current;
+      if (url && status.dashboardAvailable) webviewRef.current?.loadURL(url).catch(() => {});
+    }).catch(() => { if (mountedRef.current) setDashboardAvailable(false); });
+  }, []);
+  const newAgentTab = useCallback(() => {
+    void agentAction({ type: 'tab-new' }).then(() => {
+      if (!mountedRef.current || engineRef.current !== 'agent') return;
+      setPresentation('page');
+      setFocusAddress((request) => request + 1);
+    }).catch(() => {});
+  }, [agentAction]);
+
   const isAgent = engine === 'agent';
   const setupOverlay = isAgent && (agentStatus === 'setup' || (presentation === 'dashboard' && !dashboardAvailable));
   const pageVisible = isAgent && presentation === 'page';
@@ -713,8 +720,8 @@ export default function BrowserPane({
       <AddressBar
         url={barUrl}
         isLoading={isLoading}
-        canGoBack={!isAgent && canGoBack}
-        canGoForward={!isAgent && canGoForward}
+        canGoBack={isAgent ? agentConnected : canGoBack}
+        canGoForward={isAgent ? agentConnected : canGoForward}
         engine={engine}
         onEngineChange={onEngineChange}
         onNavigate={navigate}
@@ -724,18 +731,23 @@ export default function BrowserPane({
         onStop={stop}
         onDevTools={openDevTools}
         onMoveToWorkspace={onMoveToWorkspace}
+        agentConnected={agentConnected}
+        presentation={presentation}
+        onToggleDashboard={() => presentation === 'page' ? showDashboard() : setPresentation('page')}
+        onNewTab={newAgentTab}
+        focusRequest={focusAddress}
       />
-      {isAgent && <div>
-        <button type="button" aria-pressed={presentation === 'page'} onClick={() => setPresentation('page')}>Page</button>
-        <button type="button" aria-pressed={presentation === 'dashboard'} onClick={() => {
-          setPresentation('dashboard');
-          void window.wmux.agentBrowser.status().then((status: { dashboardAvailable: boolean }) => {
-            if (!mountedRef.current || engineRef.current !== 'agent') return;
-            setDashboardAvailable(status.dashboardAvailable);
-            const url = dashboardUrlRef.current;
-            if (url && status.dashboardAvailable) webviewRef.current?.loadURL(url).catch(() => {});
-          });
-        }}>Dashboard</button>
+      {isAgent && agentTabs.length >= 2 && <div className="browser-pane__chrome-tabs" aria-label={t('browser.agent.tabs', 'Browser tabs')}>
+        {agentTabs.map((tab) => <div key={tab.tabId} className={`browser-pane__chrome-tab${tab.active ? ' browser-pane__chrome-tab--active' : ''}`}>
+          <button type="button" className="browser-pane__chrome-tab-select" aria-pressed={tab.active} disabled={!agentConnected}
+            title={tab.url} onClick={() => { void agentAction({ type: 'tab-select', tabId: tab.tabId }).catch(() => {}); }}>
+            {tab.title || (tab.url === 'about:blank' ? t('browser.agent.newTab', 'New tab') : tab.url)}
+          </button>
+          <button type="button" className="browser-pane__chrome-tab-close" disabled={!agentConnected}
+            aria-label={t('browser.agent.closeTab', 'Close tab')} onClick={() => { void agentAction({ type: 'tab-close', tabId: tab.tabId }).catch(() => {}); }}>×</button>
+        </div>)}
+        <button type="button" className="browser-address-bar__btn" disabled={!agentConnected} onClick={newAgentTab}
+          aria-label={t('browser.agent.newTab', 'New tab')}>+</button>
       </div>}
       <div className="browser-pane__body">
         {/* @ts-ignore — webview is an Electron-specific HTML element */}
@@ -756,9 +768,10 @@ export default function BrowserPane({
           {...webviewHiding({ overlay, isBlank, isAgent, visible, keepRendering })}
         />
         {isAgent && agentError && pageVisible && <div className="browser-pane__blank" role="alert">{agentError}</div>}
-        {isAgent && agentStatus === 'live' && presentation === 'page' && <AgentBrowserViewer
-          surfaceId={surfaceId} visible={visible} focused={focused} onActivate={onActivate}
+        {isAgent && agentStatus === 'live' && <AgentBrowserViewer ref={viewerRef}
+          surfaceId={surfaceId} visible={visible && pageVisible} focused={focused} onActivate={onActivate}
           onPageState={(url, title) => { setAgentUrl(url); onUrlChange?.(url); if (title !== undefined) onTitleChangeRef.current?.(title); }}
+          onTabs={setAgentTabs} onConnection={setAgentConnected} onDashboard={showDashboard}
         />}
         {isBlank && !overlay && (
           <div className="browser-pane__blank">

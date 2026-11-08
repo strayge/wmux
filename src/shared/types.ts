@@ -51,7 +51,11 @@ export type AgentViewerInput =
 
 export type AgentViewerAction =
   | { type: 'viewport'; width: number; height: number }
-  | { type: 'copy' | 'paste' };
+  | { type: 'copy' | 'paste' | 'back' | 'forward' | 'reload' }
+  | { type: 'tab-new' }
+  | { type: 'navigate'; url: string }
+  | { type: 'tab-select' | 'tab-close'; tabId: string }
+  | { type: 'visibility'; visible: boolean };
 
 export type AgentViewerMessage =
   | { type: 'frame'; id: number; data: string; width: number; height: number }
