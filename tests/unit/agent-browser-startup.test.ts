@@ -9,9 +9,10 @@ function harness() {
   const registry = new SessionRegistry();
   const probe = vi.fn(async () => true);
   const run = vi.fn(async (_binary: string, _argv: string[], _env?: NodeJS.ProcessEnv) => ok);
-  const deps: AgentBrowserStartupDeps = { binary: () => 'native.exe', run,
+  const captureArgs = vi.fn(() => ['--args', '--force-device-scale-factor=2']);
+  const deps: AgentBrowserStartupDeps = { binary: () => 'native.exe', run, captureArgs,
     ensureSession: (id) => registry.ensureBindable(id, probe), getSession: (id) => registry.get(id), releaseSession: (id) => registry.release(id) };
-  return { registry, probe, run, deps };
+  return { registry, probe, run, captureArgs, deps };
 }
 
 describe('shared UI/CLI startup', () => {
@@ -26,10 +27,13 @@ describe('shared UI/CLI startup', () => {
     expect(h.probe).toHaveBeenCalledOnce();
     expect(h.run).toHaveBeenCalledOnce();
     expect(h.run).toHaveBeenCalledWith('native.exe',
-      ['--session', session.sessionName, '--pin-tab', 'open', ...(initial ? [initial] : [])],
-      { AGENT_BROWSER_STREAM_PORT: String(session.streamPort) });
+      ['--session', session.sessionName, '--pin-tab', '--args', '--force-device-scale-factor=2', 'open', ...(initial ? [initial] : [])],
+      { AGENT_BROWSER_STREAM_PORT: String(session.streamPort), AGENT_BROWSER_STREAM_QUALITY: '95',
+        AGENT_BROWSER_STREAM_MAX_WIDTH: '16384', AGENT_BROWSER_STREAM_MAX_HEIGHT: '16384' });
+    h.captureArgs.mockImplementation(() => { throw new Error('must not reread capture configuration'); });
     await ensureStartedSession(ID, 'https://fixture.test/never-reopen', h.deps);
     expect(h.run).toHaveBeenCalledOnce();
+    expect(h.captureArgs).toHaveBeenCalledOnce();
   });
 
   it('does not confuse allocation with a successfully started browser', async () => {
@@ -57,8 +61,9 @@ describe('shared UI/CLI startup', () => {
     const session = await renewed;
     expect(h.registry.get(ID)).toBe(session);
     expect(h.run).toHaveBeenCalledExactlyOnceWith('native.exe',
-      ['--session', session.sessionName, '--pin-tab', 'open', 'https://fixture.test/renewed'],
-      { AGENT_BROWSER_STREAM_PORT: String(session.streamPort) });
+      ['--session', session.sessionName, '--pin-tab', '--args', '--force-device-scale-factor=2', 'open', 'https://fixture.test/renewed'],
+      { AGENT_BROWSER_STREAM_PORT: String(session.streamPort), AGENT_BROWSER_STREAM_QUALITY: '95',
+        AGENT_BROWSER_STREAM_MAX_WIDTH: '16384', AGENT_BROWSER_STREAM_MAX_HEIGHT: '16384' });
   });
 
   it('does not launch a renewal that was itself cancelled while awaiting predecessor cleanup', async () => {

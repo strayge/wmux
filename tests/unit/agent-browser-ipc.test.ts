@@ -90,6 +90,11 @@ vi.mock('electron', () => ({
   nativeTheme: { on: () => {} },
 }));
 
+vi.mock('../../src/main/agent-browser-capture', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  nativeCaptureArgs: () => ['--args', '--force-device-scale-factor=2'],
+}));
+
 import { initPipeBridge } from '../../src/renderer/pipe-bridge';
 import {
   authorizeAgentBrowserSurface,
@@ -286,7 +291,7 @@ describe('enableAgentBrowser', () => {
     });
     expect(h.calls[0]).toContain('--pin-tab');
     expect(h.calls[0]).toEqual([
-      '--session', session.sessionName, '--pin-tab', 'open', 'https://example.com',
+      '--session', session.sessionName, '--pin-tab', '--args', '--force-device-scale-factor=2', 'open', 'https://example.com',
     ]);
   });
 
@@ -297,7 +302,8 @@ describe('enableAgentBrowser', () => {
     await enableAgentBrowser(SURF, undefined, h.deps);
     const session = h.registry.get(SURF)!;
 
-    expect(h.envs[0]).toEqual({ AGENT_BROWSER_STREAM_PORT: String(session.streamPort) });
+    expect(h.envs[0]).toEqual({ AGENT_BROWSER_STREAM_PORT: String(session.streamPort),
+      AGENT_BROWSER_STREAM_QUALITY: '95', AGENT_BROWSER_STREAM_MAX_WIDTH: '16384', AGENT_BROWSER_STREAM_MAX_HEIGHT: '16384' });
     expect(session.dashboardUrl).toContain(`?port=${session.streamPort}`);
   });
 
@@ -460,7 +466,7 @@ describe('browser sender ownership', () => {
       await handler(IPC_CHANNELS.AGENT_BROWSER_ENABLE)(h.event, id, 'about:blank');
       expect(native.mock.calls.map((call) => call[1])).toEqual([
         ['--session', original!.sessionName, 'close'], ['--session', original!.sessionName, 'close'],
-        ['--session', original!.sessionName, '--pin-tab', 'open'],
+        ['--session', original!.sessionName, '--pin-tab', '--args', '--force-device-scale-factor=2', 'open'],
       ]);
       expect(runtime.getStartedSession(id)).toBeDefined();
     } finally {
@@ -854,6 +860,6 @@ describe('enableAgentBrowser session allocation', () => {
     const res = await enableAgentBrowser(SURF, undefined, deps);
     const session = registry.get(SURF)!;
     expect(res.sessionName).toBe(session.sessionName);
-    expect(h.calls[0]).toEqual(['--session', session.sessionName, '--pin-tab', 'open']);
+    expect(h.calls[0]).toEqual(['--session', session.sessionName, '--pin-tab', '--args', '--force-device-scale-factor=2', 'open']);
   });
 });

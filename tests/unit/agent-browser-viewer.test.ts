@@ -296,14 +296,14 @@ describe('surface stream subscriptions', () => {
 });
 
 describe('finite native actions and input', () => {
-  it('uses native viewport and only main-owned paste/selection evaluations', async () => {
+  it('keeps CSS viewport dimensions with fixed 2x density and only main-owned paste/selection evaluations', async () => {
     const h = harness();
     h.present();
     await h.viewer.action(ID, 10, 'token-a', 1, { type: 'viewport', width: 900, height: 640 });
     await h.viewer.action(ID, 10, 'token-a', 1, { type: 'paste', argv: ['close'] });
     await h.viewer.action(ID, 10, 'token-a', 1, { type: 'copy', js: 'malicious' });
     expect(h.run.mock.calls).toEqual([
-      [SESSION, ['set', 'viewport', '900', '640']],
+      [SESSION, ['set', 'viewport', '900', '640', '2']],
       [SESSION, ['eval', `document.execCommand('insertText', false, "Pasted 漢字")`]],
       [SESSION, ['eval', expect.stringContaining('selectionStart')]],
     ]);

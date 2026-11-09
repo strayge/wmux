@@ -4,6 +4,7 @@
  * only one frame crosses IPC until the renderer acknowledges drawing/dropping it.
  */
 import WebSocket from 'ws';
+import { AGENT_BROWSER_CAPTURE_SCALE } from './agent-browser-capture';
 import type { AgentSession } from './agent-browser-session';
 import { agentBrowserPath, runAgentBrowser, unwrapAgentData, observedBrowserReplacement, type RunResult } from './agent-browser-cli';
 import { getStartedSession } from './agent-browser-runtime';
@@ -362,7 +363,7 @@ export class AgentBrowserViewer {
     switch (action.type) {
       case 'viewport':
         if (!sub.visible || !dimension(action.width) || !dimension(action.height)) throw new Error('Invalid viewport');
-        argv = ['set', 'viewport', String(action.width), String(action.height)]; break;
+        argv = ['set', 'viewport', String(action.width), String(action.height), String(AGENT_BROWSER_CAPTURE_SCALE)]; break;
       case 'paste': case 'insert-text': {
         const insertion = insertTextArgv(action.type === 'insert-text' ? action.text : this.deps.readClipboard());
         if (!insertion) return;

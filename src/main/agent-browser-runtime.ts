@@ -16,6 +16,7 @@
  * allocating a record is not the same as successfully launching Chrome.
  */
 import * as net from 'net';
+import { AGENT_BROWSER_STREAM_DEFAULTS, nativeCaptureArgs } from './agent-browser-capture';
 import { agentBrowserPath, runAgentBrowser, unwrapAgentData, type RunResult } from './agent-browser-cli';
 import { DashboardDaemon } from './agent-browser-daemon';
 import {
@@ -607,6 +608,7 @@ export interface AgentBrowserStartupDeps {
   ensureSession: (id: SurfaceId) => AgentSession | Promise<AgentSession>;
   getSession: (id: SurfaceId) => AgentSession | undefined;
   releaseSession?: (id: SurfaceId) => AgentSession | undefined;
+  captureArgs?: () => string[];
   run: (binary: string, argv: string[], env?: NodeJS.ProcessEnv) => Promise<RunResult>;
 }
 
@@ -649,8 +651,8 @@ export function ensureStartedSession(
       throw new Error('Browser startup cancelled');
     }
     const res = await deps.run(binary,
-      ['--session', session.sessionName, '--pin-tab', 'open', ...(url && url !== 'about:blank' ? [url] : [])],
-      { AGENT_BROWSER_STREAM_PORT: String(session.streamPort) });
+      ['--session', session.sessionName, '--pin-tab', ...(deps.captureArgs ?? nativeCaptureArgs)(), 'open', ...(url && url !== 'about:blank' ? [url] : [])],
+      { ...AGENT_BROWSER_STREAM_DEFAULTS, AGENT_BROWSER_STREAM_PORT: String(session.streamPort) });
     if (launch.cancelled || deps.getSession(id) !== session) {
       const closed = await deps.run(binary, ['--session', session.sessionName, 'close']).catch(() => null);
       launch.closed = closed?.ok === true;
