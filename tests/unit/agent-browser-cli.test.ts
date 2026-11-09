@@ -403,6 +403,7 @@ describe('runAgentBrowser', () => {
     const result = await runAgentBrowser(process.execPath, ['-e', 'setTimeout(()=>{}, 60000)'], 700);
     expect(result.ok).toBe(false);
     expect(result.spawnFailed).toBe(false); // it ran; it just took too long
+    expect(result.timedOut).toBe(true);
     expect(result.stderr).toMatch(/timed out/);
     expect(Date.now() - started).toBeLessThan(5000);
   });
