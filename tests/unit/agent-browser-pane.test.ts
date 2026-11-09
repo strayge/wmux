@@ -3,6 +3,14 @@ import { act, createElement, useEffect, useImperativeHandle, type Ref } from 're
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import BrowserPane, { disableTarget, engineTransition, resolveInputUrl, webviewHiding } from '../../src/renderer/components/Browser/BrowserPane';
+import { create } from 'zustand';
+import { createSurfaceSlice, type SurfaceSlice } from '../../src/renderer/store/surface-slice';
+import { createWorkspaceSlice, type WorkspaceSlice } from '../../src/renderer/store/workspace-slice';
+import { createLeaf, findLeaf, splitNode } from '../../src/renderer/store/split-utils';
+import type { PaneId, SplitNode, SurfaceId } from '../../src/shared/types';
+import { ensureStartedSession, releaseAgentSession, type AgentBrowserStartupDeps } from '../../src/main/agent-browser-runtime';
+import { SessionRegistry } from '../../src/main/agent-browser-session';
+import { AgentBrowserViewer as MainAgentBrowserViewer } from '../../src/main/agent-browser-viewer';
 
 const viewerAction = vi.hoisted(() => vi.fn(async (_action: unknown) => {}));
 const tabs = [
@@ -255,6 +263,410 @@ describe('Page presentation', () => {
     api.enable.mockResolvedValueOnce({ installed: true });
     await click('Try again');
     expect(container.querySelector('[data-viewer="true"]')).toBeTruthy();
+  });
+});
+
+describe('Agent surface lifetime belongs to the store, not the view', () => {
+  const paneId = 'pane-retained' as PaneId;
+  const neighborId = 'pane-neighbor' as PaneId;
+  let surfaceId: SurfaceId;
+  let nextSurface = 0;
+  let defaultUrl: string | undefined;
+  const makeStore = () => create<WorkspaceSlice & SurfaceSlice>()((...args) => ({
+    ...createWorkspaceSlice(...args), ...createSurfaceSlice(...args),
+  }));
+  let store: ReturnType<typeof makeStore>;
+  let workspaceId: ReturnType<WorkspaceSlice['createWorkspace']>;
+  let launch: ReturnType<typeof vi.fn>;
+  let viewerPolicy: MainAgentBrowserViewer;
+
+  beforeEach(() => {
+    surfaceId = `surf-retained-${nextSurface++}` as SurfaceId;
+    defaultUrl = undefined;
+    store = makeStore();
+    workspaceId = store.getState().createWorkspace({ title: 'Agent', splitTree: {
+      ...createLeaf(paneId, 'browser'),
+      surfaces: [{ id: surfaceId, type: 'browser', browserEngine: 'agent', url: 'https://initial.test/' }],
+    } });
+    const registry = new SessionRegistry();
+    launch = vi.fn(async () => ({ ok: true, spawnFailed: false, data: null, stdout: '', stderr: '' }));
+    const deps: AgentBrowserStartupDeps = { binary: () => 'mock-native', run: launch,
+      ensureSession: (id) => registry.ensure(id), getSession: (id) => registry.get(id), releaseSession: (id) => registry.release(id) };
+    viewerPolicy = new MainAgentBrowserViewer({ session: (id) => registry.get(id),
+      connect: vi.fn(), run: launch, readClipboard: () => '', writeClipboard: () => {} });
+    api.enable.mockImplementation(async (id, url) => {
+      if (!viewerPolicy.canEnable(id)) throw new Error('Browser session is paused. Retry Start new session before enabling it.');
+      await ensureStartedSession(id, url, deps);
+      return { installed: true };
+    });
+    api.disable.mockImplementation(async (id) => {
+      viewerPolicy.forget(id);
+      releaseAgentSession(id);
+      registry.release(id);
+      return {};
+    });
+  });
+
+  afterEach(async () => {
+    await act(async () => store.getState().closeWorkspace(workspaceId));
+  });
+
+  function Layout({ absent = false }: { absent?: boolean }) {
+    const workspaces = store((s) => s.workspaces);
+    const renderTree = (tree: SplitNode): ReturnType<typeof createElement> => {
+      if (tree.type === 'branch') return createElement('div', { key: 'branch' }, ...tree.children.map(renderTree));
+      const surface = tree.surfaces.find((s) => s.id === surfaceId);
+      return createElement('section', { key: tree.paneId }, surface && !absent && createElement(BrowserPane, {
+        surfaceId, engine: surface.browserEngine, initialUrl: surface.url || defaultUrl,
+        onUrlChange: (url) => store.getState().updateSurface(workspaceId, tree.paneId, surfaceId, { url }),
+      }));
+    };
+    return workspaces[0] ? renderTree(workspaces[0].splitTree) : null;
+  }
+  const layout = async (absent = false) => { await act(async () => root.render(createElement(Layout, { absent }))); };
+  const patch = async (browserEngine: 'web' | 'agent') => {
+    await act(async () => store.getState().updateSurface(workspaceId, paneId, surfaceId, { browserEngine }));
+  };
+  const savedUrl = () => findLeaf(store.getState().workspaces[0].splitTree, paneId)!.surfaces[0].url;
+
+  it.each([false, true])('retains the same session across actual split/collapse remounts (startup pending: %s)', async (pending) => {
+    let finish!: (value: Awaited<ReturnType<typeof launch>>) => void;
+    if (pending) launch.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    await layout();
+    const original = container.querySelector('.browser-pane');
+    await act(async () => store.getState().updateSplitTree(workspaceId,
+      splitNode(store.getState().workspaces[0].splitTree, paneId, neighborId, 'terminal', 'horizontal')));
+    expect(container.querySelector('.browser-pane')).not.toBe(original);
+    await act(async () => store.getState().closePane(workspaceId, neighborId));
+    expect(api.disable).not.toHaveBeenCalled();
+    expect(api.enable.mock.calls.map((call) => call[0])).toEqual([surfaceId, surfaceId, surfaceId]);
+    expect(launch).toHaveBeenCalledOnce();
+    if (pending) await act(async () => finish({ ok: true, spawnFailed: false, data: null, stdout: '', stderr: '' }));
+    expect(container.querySelector('[data-viewer="true"]')).toBeTruthy();
+    expect(launch).toHaveBeenCalledOnce();
+  });
+
+  it('cannot clear a failed-restart pause by unmounting and mounting again', async () => {
+    await layout();
+    viewerPolicy.pauseForRestart(surfaceId);
+    await layout(true);
+    await layout();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain('session is paused');
+    expect(viewerPolicy.canEnable(surfaceId)).toBe(false);
+    expect(api.disable).not.toHaveBeenCalled();
+    expect(launch).toHaveBeenCalledOnce();
+  });
+
+  it('still cancels in-flight native startup on real close while its view is absent', async () => {
+    let finish!: (value: Awaited<ReturnType<typeof launch>>) => void;
+    launch.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    await layout();
+    await layout(true);
+    expect(api.disable).not.toHaveBeenCalled();
+    await act(async () => store.getState().closeWorkspace(workspaceId));
+    expect(api.disable).toHaveBeenCalledExactlyOnceWith(surfaceId);
+    await act(async () => finish({ ok: true, spawnFailed: false, data: null, stdout: '', stderr: '' }));
+    expect(launch).toHaveBeenCalledTimes(2);
+    expect(launch.mock.calls[1][1].at(-1)).toBe('close');
+    expect(container.querySelector('[data-viewer]')).toBeNull();
+  });
+
+  it.each(['surface', 'pane', 'workspace', 'layout'])('closes an Agent %s even with no mounted view', async (kind) => {
+    await layout();
+    await layout(true);
+    expect(api.disable).not.toHaveBeenCalled();
+    await act(async () => {
+      if (kind === 'surface') store.getState().closeSurface(workspaceId, paneId, surfaceId);
+      if (kind === 'pane') store.getState().closePane(workspaceId, paneId);
+      if (kind === 'workspace') store.getState().closeWorkspace(workspaceId);
+      if (kind === 'layout') store.getState().replaceAllWorkspaces([{ title: 'replacement', splitTree: createLeaf() }]);
+    });
+    expect(api.disable).toHaveBeenCalledWith(surfaceId);
+  });
+
+  it('closes a retained Agent ID when restoring its saved Web layout without replacing the restored URL', async () => {
+    await layout();
+    await patch('web');
+    const saved = store.getState().workspaces[0];
+    await patch('agent');
+    await layout(true);
+    api.disable.mockClear();
+    let finish!: (value: { url: string }) => void;
+    api.disable.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    await act(async () => {
+      store.getState().replaceAllWorkspaces([saved]);
+      workspaceId = store.getState().workspaces[0].id;
+    });
+    expect(api.disable).toHaveBeenCalledExactlyOnceWith(surfaceId);
+    await layout();
+    await act(async () => finish({ url: 'https://outgoing-agent.test/' }));
+    expect(savedUrl()).toBe('https://initial.test/');
+    expect(loadURL).not.toHaveBeenCalledWith('https://outgoing-agent.test/');
+    await act(async () => store.getState().closeWorkspace(workspaceId));
+    expect(api.disable).toHaveBeenCalledOnce();
+  });
+
+  it.each([false, true])('starts a new close lifetime on Web-to-Agent layout replacement (old close pending: %s)', async (pending) => {
+    await layout();
+    const savedAgent = store.getState().workspaces[0];
+    let finish!: (value: { url: string }) => void;
+    if (pending) api.disable.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    await patch('web');
+    await act(async () => {
+      store.getState().replaceAllWorkspaces([savedAgent]);
+      workspaceId = store.getState().workspaces[0].id;
+    });
+    await act(async () => store.getState().closeWorkspace(workspaceId));
+    expect(api.disable.mock.calls).toEqual([[surfaceId], [surfaceId]]);
+    if (pending) await act(async () => finish({ url: 'https://old-agent.test/' }));
+  });
+
+  it('keeps the native session when layout replacement retains an Agent ID in Agent mode', async () => {
+    await layout();
+    const savedAgent = store.getState().workspaces[0];
+    await act(async () => {
+      store.getState().replaceAllWorkspaces([savedAgent]);
+      workspaceId = store.getState().workspaces[0].id;
+    });
+    expect(api.disable).not.toHaveBeenCalled();
+    expect(launch).toHaveBeenCalledOnce();
+    await act(async () => store.getState().closeWorkspace(workspaceId));
+    expect(api.disable).toHaveBeenCalledExactlyOnceWith(surfaceId);
+  });
+
+  it.each([false, true])('hands fresh readback to Web with one disable (view absent: %s)', async (absent) => {
+    await layout();
+    await click('fixture page');
+    if (absent) await layout(true);
+    let finish!: (value: { url: string }) => void;
+    api.disable.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    await patch('web');
+    expect(api.disable).toHaveBeenCalledExactlyOnceWith(surfaceId);
+    if (absent) await layout();
+    await act(async () => finish({ url: 'https://fresh.test/' }));
+    expect(savedUrl()).toBe('https://fresh.test/');
+    expect(loadURL).toHaveBeenLastCalledWith('https://fresh.test/');
+    expect(api.disable).toHaveBeenCalledOnce();
+  });
+
+  it.each(['did-navigate', 'did-stop-loading', 'did-start-navigation'])('ignores late Dashboard %s during the Agent-to-Web handoff', async (event) => {
+    const dashboard = 'https://dashboard.test/';
+    api.enable.mockResolvedValue({ installed: true, dashboardUrl: dashboard });
+    await layout();
+    await click('…');
+    await click('Show dashboard');
+    const wv = container.querySelector('webview')!;
+    Object.assign(wv, { getURL: () => dashboard, canGoBack: () => false, canGoForward: () => false });
+    let finish!: (value: { url: string }) => void;
+    api.disable.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    await patch('web');
+    loadURL.mockClear();
+    await act(async () => wv.dispatchEvent(Object.assign(new Event(event), { url: dashboard, isMainFrame: true })));
+    expect(savedUrl()).toBe('https://initial.test/');
+    await act(async () => finish({ url: 'https://native-readback.test/' }));
+    expect(savedUrl()).toBe('https://native-readback.test/');
+    expect(loadURL).toHaveBeenLastCalledWith('https://native-readback.test/');
+    expect(api.disable).toHaveBeenCalledExactlyOnceWith(surfaceId);
+  });
+
+  it.each(['https://explicit-web.test/', 'https://dashboard.test/'])('lets explicit Web navigation to %s supersede readback even with the outgoing Dashboard guest', async (url) => {
+    api.enable.mockResolvedValue({ installed: true, dashboardUrl: 'https://dashboard.test/' });
+    await layout();
+    await click('…');
+    await click('Show dashboard');
+    const wv = container.querySelector('webview')!;
+    Object.assign(wv, { getURL: () => url, canGoBack: () => false, canGoForward: () => false });
+    let finish!: (value: { url: string }) => void;
+    api.disable.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    await patch('web');
+    await act(async () => window.dispatchEvent(new CustomEvent('wmux:browser-navigate', { detail: { surfaceId, url } })));
+    expect(loadURL).toHaveBeenLastCalledWith(url);
+    await act(async () => {
+      wv.dispatchEvent(Object.assign(new Event('did-start-navigation'), { url, isMainFrame: true }));
+      wv.dispatchEvent(Object.assign(new Event('did-navigate'), { url }));
+      wv.dispatchEvent(new Event('did-stop-loading'));
+    });
+    loadURL.mockClear();
+    await act(async () => finish({ url: 'https://older-native.test/' }));
+    expect(savedUrl()).toBe(url);
+    expect(container.querySelector('input')?.value).toBe(url);
+    expect(loadURL).not.toHaveBeenCalled();
+    expect(api.disable).toHaveBeenCalledExactlyOnceWith(surfaceId);
+  });
+
+  it.each([
+    { restoredUrl: 'https://initial.test/', navigateAgain: false },
+    { restoredUrl: 'https://restored-web.test/', navigateAgain: false },
+    { restoredUrl: 'https://restored-web.test/', navigateAgain: true },
+    { restoredUrl: undefined, navigateAgain: false },
+    { restoredUrl: '', navigateAgain: false },
+    { restoredUrl: undefined, navigateAgain: false, startUrl: 'https://configured-start.test/' },
+  ])('loads a retained mounted Agent Dashboard guest onto the incoming saved Web URL ($restoredUrl, newer navigation: $navigateAgain)', async ({ restoredUrl, navigateAgain, startUrl }) => {
+    api.enable.mockResolvedValue({ installed: true, dashboardUrl: 'https://dashboard.test/' });
+    await layout();
+    await click('…');
+    await click('Show dashboard');
+    const wv = container.querySelector('webview')!;
+    Object.assign(wv, { getURL: () => 'https://dashboard.test/' });
+    const saved = store.getState().workspaces[0];
+    defaultUrl = startUrl;
+    let finish!: (value: { url?: string }) => void;
+    api.disable.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    loadURL.mockClear();
+    await act(async () => {
+      store.getState().replaceAllWorkspaces([{ ...saved, splitTree: {
+        ...createLeaf(paneId, 'browser'), surfaces: [{ id: surfaceId, type: 'browser', url: restoredUrl }],
+      } }]);
+      workspaceId = store.getState().workspaces[0].id;
+    });
+    expect(container.querySelector('webview')).toBe(wv);
+    if (navigateAgain) {
+      const url = 'https://newer-explicit.test/';
+      await act(async () => window.dispatchEvent(new CustomEvent('wmux:browser-navigate', { detail: { surfaceId, url } })));
+      Object.assign(wv, { getURL: () => url, canGoBack: () => false, canGoForward: () => false });
+      await act(async () => wv.dispatchEvent(Object.assign(new Event('did-navigate'), { url })));
+      await act(async () => finish({ url: 'https://older-native.test/' }));
+      expect(savedUrl()).toBe(url);
+      expect(loadURL).toHaveBeenLastCalledWith(url);
+      expect(loadURL).not.toHaveBeenCalledWith(restoredUrl);
+    } else {
+      await act(async () => finish({}));
+      expect(savedUrl()).toBe(restoredUrl);
+      expect(loadURL).toHaveBeenLastCalledWith(restoredUrl || startUrl || 'about:blank');
+    }
+    expect(api.disable).toHaveBeenCalledExactlyOnceWith(surfaceId);
+  });
+
+  it('persists fresh readback when the Web view mounts only after teardown completes', async () => {
+    await layout();
+    await layout(true);
+    api.disable.mockResolvedValueOnce({ url: 'https://unmounted.test/' });
+    await patch('web');
+    expect(savedUrl()).toBe('https://unmounted.test/');
+    await layout();
+    expect(container.querySelector('input')?.value).toBe('https://unmounted.test/');
+    expect(api.disable).toHaveBeenCalledOnce();
+  });
+
+  it('does not replay a completed handoff over a later Web navigation on remount', async () => {
+    await layout();
+    api.disable.mockResolvedValueOnce({ url: 'https://readback.test/' });
+    await patch('web');
+    await act(async () => store.getState().updateSurface(workspaceId, paneId, surfaceId, { url: 'https://later-web.test/' }));
+    await layout(true);
+    loadURL.mockClear();
+    await layout();
+    expect(container.querySelector('input')?.value).toBe('https://later-web.test/');
+    expect(loadURL).not.toHaveBeenCalled();
+    expect(api.disable).toHaveBeenCalledOnce();
+  });
+
+  it.each(['store', 'page', 'page-start', 'address'])('keeps newer %s Web navigation across a pending handoff and split/collapse remount', async (navigation) => {
+    await layout();
+    let finish!: (value: { url: string }) => void;
+    api.disable.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    await patch('web');
+    await act(async () => store.getState().updateSplitTree(workspaceId,
+      splitNode(store.getState().workspaces[0].splitTree, paneId, neighborId, 'terminal', 'horizontal')));
+    const nextUrl = 'https://newer-web.test/';
+    if (navigation === 'store') {
+      await act(async () => store.getState().updateSurface(workspaceId, paneId, surfaceId, { url: nextUrl }));
+    } else if (navigation === 'address') {
+      await act(async () => window.dispatchEvent(new CustomEvent('wmux:browser-navigate', { detail: { surfaceId, url: nextUrl } })));
+    } else {
+      const wv = container.querySelector('webview')!;
+      Object.assign(wv, { canGoBack: () => false, canGoForward: () => false });
+      const event = navigation === 'page-start' ? 'did-start-navigation' : 'did-navigate';
+      await act(async () => wv.dispatchEvent(Object.assign(new Event(event), { url: nextUrl, isMainFrame: true })));
+    }
+    loadURL.mockClear();
+    await act(async () => finish({ url: 'https://older-agent.test/' }));
+    expect(loadURL).not.toHaveBeenCalledWith('https://older-agent.test/');
+    expect(savedUrl()).not.toBe('https://older-agent.test/');
+    if (navigation === 'store' || navigation === 'page') expect(savedUrl()).toBe(nextUrl);
+    await act(async () => store.getState().closePane(workspaceId, neighborId));
+    expect(api.disable).toHaveBeenCalledExactlyOnceWith(surfaceId);
+  });
+
+  it('does not invalidate pending readback when the remounted Web guest initially loads its saved URL', async () => {
+    await layout();
+    let finish!: (value: { url: string }) => void;
+    api.disable.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    await patch('web');
+    await layout(true);
+    await layout();
+    const wv = container.querySelector('webview')!;
+    Object.assign(wv, { getURL: () => 'https://initial.test/', canGoBack: () => false, canGoForward: () => false });
+    await act(async () => {
+      wv.dispatchEvent(Object.assign(new Event('did-start-navigation'), { url: 'https://initial.test/', isMainFrame: true }));
+      wv.dispatchEvent(Object.assign(new Event('did-navigate'), { url: 'https://initial.test/' }));
+      wv.dispatchEvent(new Event('did-stop-loading'));
+    });
+    await act(async () => finish({ url: 'https://fresh.test/' }));
+    expect(savedUrl()).toBe('https://fresh.test/');
+    expect(loadURL).toHaveBeenLastCalledWith('https://fresh.test/');
+    expect(api.disable).toHaveBeenCalledExactlyOnceWith(surfaceId);
+  });
+
+  it('does not replace an explicit restored Web URL with a pending handoff from the prior layout', async () => {
+    await layout();
+    let finish!: (value: { url: string }) => void;
+    api.disable.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    await patch('web');
+    await layout(true);
+    const saved = store.getState().workspaces[0];
+    await act(async () => {
+      store.getState().replaceAllWorkspaces([{ ...saved, splitTree: {
+        ...createLeaf(paneId, 'browser'), surfaces: [{ id: surfaceId, type: 'browser', url: 'https://restored-web.test/' }],
+      } }]);
+      workspaceId = store.getState().workspaces[0].id;
+    });
+    await layout();
+    await act(async () => finish({ url: 'https://older-agent.test/' }));
+    expect(savedUrl()).toBe('https://restored-web.test/');
+    expect(loadURL).not.toHaveBeenCalledWith('https://older-agent.test/');
+    expect(api.disable).toHaveBeenCalledExactlyOnceWith(surfaceId);
+  });
+
+  it('persists the last streamed URL when unmounted readback fails', async () => {
+    await layout();
+    await click('fixture page');
+    await layout(true);
+    api.disable.mockRejectedValueOnce(new Error('readback failed'));
+    await patch('web');
+    expect(api.disable).toHaveBeenCalledOnce();
+    await layout();
+    expect(savedUrl()).toBe('https://agent.test/next');
+    expect(container.querySelector('input')?.value).toBe('https://agent.test/next');
+  });
+
+  it('invalidates a pending handoff immediately on real close, even if the ID is later loaded again', async () => {
+    await layout();
+    let finish!: (value: { url: string }) => void;
+    api.disable.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    await patch('web');
+    await act(async () => {
+      store.getState().closeWorkspace(workspaceId);
+      workspaceId = store.getState().createWorkspace({ title: 'Loaded', splitTree: {
+        ...createLeaf(paneId, 'browser'), surfaces: [{ id: surfaceId, type: 'browser', url: 'https://loaded.test/' }],
+      } });
+    });
+    await act(async () => finish({ url: 'https://closed.test/' }));
+    expect(savedUrl()).toBe('https://loaded.test/');
+    expect(loadURL).not.toHaveBeenCalledWith('https://closed.test/');
+  });
+
+  it('does not apply an old readback to a newer Agent/Web transition', async () => {
+    await layout();
+    let finish!: (value: { url: string }) => void;
+    api.disable.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    await patch('web');
+    await patch('agent');
+    api.disable.mockResolvedValueOnce({ url: 'https://new.test/' });
+    await patch('web');
+    await act(async () => finish({ url: 'https://stale.test/' }));
+    expect(savedUrl()).toBe('https://new.test/');
+    expect(loadURL).not.toHaveBeenCalledWith('https://stale.test/');
   });
 });
 

@@ -6,6 +6,7 @@ import AgentBrowserViewer, { type AgentViewerHandle } from './AgentBrowserViewer
 import { popupBridgeSource } from './popup-bridge';
 import type { AgentBrowserTab, AgentViewerAction, BrowserEngine } from '../../../shared/types';
 import { BROWSER_BLANK_PAGE } from '../../utils/browser-start-page';
+import { canApplyAgentBrowserReadback, getAgentBrowserHandoff, hasPendingAgentBrowserHandoff, invalidateAgentBrowserReadback } from '../../store/agent-browser-handoff';
 import { useKeepRendering } from '../../utils/browser-keep-rendering';
 import { openInNewBrowserTab } from '../../utils/open-in-browser';
 import { buildBrowserContextMenu, linkStatusText } from '../../../shared/browser-context-menu';
@@ -277,6 +278,8 @@ export default function BrowserPane({
   engineRef.current = engine;
   const currentUrlRef = useRef(currentUrl);
   currentUrlRef.current = currentUrl;
+  const initialUrlRef = useRef(initialUrl);
+  initialUrlRef.current = initialUrl;
   const agentUrlRef = useRef(agentUrl);
   agentUrlRef.current = agentUrl;
 
@@ -295,11 +298,9 @@ export default function BrowserPane({
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
-      // StrictMode double-invokes effects in dev: the pane is torn down and set
-      // up again on the SAME instance, so the refs survive. Putting the
-      // previous engine back to its seed is what makes the second setup redo
-      // the switch — otherwise a pane restored in agent mode would be enabled,
-      // disabled by the simulated unmount, and never enabled again.
+      // Invalidate answers from the detached view, including StrictMode's
+      // simulated unmount. The next setup joins the same main-process startup.
+      switchSeqRef.current++;
       prevEngineRef.current = 'web';
     };
   }, []);
@@ -307,6 +308,13 @@ export default function BrowserPane({
   /** Toolbar commands never address the dashboard guest or start a session. */
   const agentAction = useCallback((action: AgentViewerAction) => {
     return viewerRef.current?.action(action) ?? Promise.reject(new Error('Page is not connected'));
+  }, []);
+
+  // Engine state changes before the outgoing dashboard finishes loading. Keep
+  // its identity until a Web commit (or an explicit toolbar command) owns it.
+  const isOutgoingDashboardUrl = useCallback((url: string) => {
+    const dashboard = dashboardUrlRef.current;
+    return !!dashboard && url.startsWith(dashboard.split('?')[0]);
   }, []);
 
   const navigate = useCallback((newUrl: string) => {
@@ -322,21 +330,29 @@ export default function BrowserPane({
     // cases (a client-side redirect, an unreachable host, navigating again
     // mid-load); those are reflected by the did-*-load handlers below, so
     // swallow the promise rejection rather than leaving it unhandled.
+    invalidateAgentBrowserReadback(surfaceId);
+    dashboardUrlRef.current = null;
     webviewRef.current?.loadURL(resolved).catch(() => {});
-  }, [agentAction]);
+  }, [agentAction, surfaceId]);
 
   const goBack = useCallback(() => {
     if (engineRef.current === 'agent') { void agentAction({ type: 'back' }).catch(() => {}); return; }
+    invalidateAgentBrowserReadback(surfaceId);
+    dashboardUrlRef.current = null;
     webviewRef.current?.goBack();
-  }, [agentAction]);
+  }, [agentAction, surfaceId]);
   const goForward = useCallback(() => {
     if (engineRef.current === 'agent') { void agentAction({ type: 'forward' }).catch(() => {}); return; }
+    invalidateAgentBrowserReadback(surfaceId);
+    dashboardUrlRef.current = null;
     webviewRef.current?.goForward();
-  }, [agentAction]);
+  }, [agentAction, surfaceId]);
   const reload = useCallback(() => {
     if (engineRef.current === 'agent') { void agentAction({ type: 'reload' }).catch(() => {}); return; }
+    invalidateAgentBrowserReadback(surfaceId);
+    dashboardUrlRef.current = null;
     webviewRef.current?.reload();
-  }, [agentAction]);
+  }, [agentAction, surfaceId]);
   useEffect(() => {
     const onRefresh = (event: Event) => {
       const id = (event as CustomEvent<{ surfaceId?: string }>).detail?.surfaceId;
@@ -371,25 +387,35 @@ export default function BrowserPane({
       }).catch(() => {});
     };
 
+    const reportWebUrl = (url: string) => {
+      if (isOutgoingDashboardUrl(url)) return false;
+      // The initial guest load is not newer user intent. A different URL is,
+      // including page links and CDP navigation that bypass the address bar.
+      if (url !== currentUrlRef.current) invalidateAgentBrowserReadback(surfaceId);
+      dashboardUrlRef.current = null;
+      currentUrlRef.current = url;
+      setCurrentUrl(url);
+      onUrlChange?.(url);
+      return true;
+    };
     const onNavigate = (e: any) => {
       // In agent mode every navigation here is the dashboard SPA moving around
       // inside itself. Recording it would overwrite the surface's persisted
       // `url` with the dashboard, so flipping back to web would land on the
       // viewer instead of the page.
       if (engineRef.current === 'agent') return;
-      setCurrentUrl(e.url);
-      onUrlChange?.(e.url);
+      if (!reportWebUrl(e.url)) return;
       setCanGoBack(wv.canGoBack());
       setCanGoForward(wv.canGoForward());
       refreshHistory();
+      return true;
     };
     // The old page's title goes with its document. Measured on a real webview:
     // did-navigate always comes before the new page's title event, and a page
     // with no <title> fires none, so without this it would keep the old title.
     // Not for an in-page navigation: the document stays, and so does its title.
     const onNewDocument = (e: any) => {
-      onNavigate(e);
-      if (engineRef.current !== 'agent') onTitleChangeRef.current?.('');
+      if (onNavigate(e)) onTitleChangeRef.current?.('');
     };
     const onTitle = (e: any) => {
       if (engineRef.current === 'agent') return; // the dashboard's own title
@@ -399,9 +425,7 @@ export default function BrowserPane({
     const onStopLoad = () => {
       setIsLoading(false);
       if (engineRef.current === 'agent') return;
-      const finalUrl = wv.getURL();
-      setCurrentUrl(finalUrl);
-      onUrlChange?.(finalUrl);
+      if (!reportWebUrl(wv.getURL())) return;
       // Titles arrive after the commit; this is when the entry has its own.
       refreshHistory();
     };
@@ -451,7 +475,13 @@ export default function BrowserPane({
       setHoverUrl(engineRef.current === 'agent' ? '' : linkStatusText(e?.url));
     };
     const clearHover = () => setHoverUrl('');
-    const onStartNavigation = (e: any) => { if (e?.isMainFrame !== false) clearHover(); };
+    const onStartNavigation = (e: any) => {
+      if (e?.isMainFrame === false) return;
+      clearHover();
+      if (engineRef.current !== 'agent' && e?.url && !isOutgoingDashboardUrl(e.url) && e.url !== currentUrlRef.current) {
+        invalidateAgentBrowserReadback(surfaceId);
+      }
+    };
     const onContextMenu = (e: any) => {
       if (engineRef.current === 'agent') return;
       const params = e?.params ?? {};
@@ -641,19 +671,17 @@ export default function BrowserPane({
     const seq = ++switchSeqRef.current;
     const stale = () => !mountedRef.current || switchSeqRef.current !== seq;
     setAgentStatus('idle');
-    dashboardUrlRef.current = null;
 
-    let result: { url?: string } | null;
-    try {
-      result = (await window.wmux?.agentBrowser?.disable(surfaceId)) ?? null;
-    } catch {
-      result = null;
-    }
-    if (stale()) return;
+    const handoff = getAgentBrowserHandoff(surfaceId);
+    const result = (await handoff?.promise) ?? null;
+    const restoredUrl = getAgentBrowserHandoff(surfaceId) === handoff ? handoff?.restoredUrl : undefined;
+    if (stale() || (handoff && restoredUrl === undefined && !canApplyAgentBrowserReadback(surfaceId, handoff.promise))) return;
 
     const showing = webviewRef.current?.getURL?.() ?? '';
-    const target = disableTarget(result, agentUrlRef.current || currentUrlRef.current, showing);
+    const destination = restoredUrl === undefined ? result : { url: restoredUrl || initialUrlRef.current || BROWSER_BLANK_PAGE };
+    const target = disableTarget(destination, agentUrlRef.current || currentUrlRef.current, showing);
     if (target) {
+      currentUrlRef.current = target;
       setCurrentUrl(target);
       webviewRef.current?.loadURL(target).catch(() => {});
     } else {
@@ -663,13 +691,15 @@ export default function BrowserPane({
     }
   }, [surfaceId]);
 
+  // Capture at render: readback may settle before this commit's passive effect.
+  const joiningAgentHandoff = engine === 'web' && hasPendingAgentBrowserHandoff(surfaceId);
   useEffect(() => {
     const prev = prevEngineRef.current;
     prevEngineRef.current = engine;
     const decision = engineTransition(prev, engine, currentUrlRef.current);
     if (decision.action === 'enable') { freshStartRef.current = false; void enterAgentMode(decision.url); }
-    else if (decision.action === 'disable') void leaveAgentMode();
-  }, [engine, enterAgentMode, leaveAgentMode]);
+    else if (decision.action === 'disable' || joiningAgentHandoff) void leaveAgentMode();
+  }, [engine, enterAgentMode, leaveAgentMode, joiningAgentHandoff]);
 
   // Streamed tabs supply the Agent title; leaving clears it for the Web page.
   const wasAgentRef = useRef(false);
@@ -682,14 +712,8 @@ export default function BrowserPane({
     wasAgentRef.current = true;
   }, [engine]);
 
-  // A pane that goes away in agent mode still owns a Chrome and a dashboard
-  // refcount. `disable` is idempotent, so calling it for a pane that was never
-  // enabled is a no-op rather than something to guard against.
-  useEffect(() => () => {
-    if (engineRef.current === 'agent') {
-      window.wmux?.agentBrowser?.disable(surfaceId)?.catch?.(() => {});
-    }
-  }, [surfaceId]);
+  // React unmount only detaches AgentBrowserViewer's stream. The surface owns
+  // Chrome across split-tree reparenting; store close/engine transitions reap it.
 
   // Listen for programmatic navigation (e.g. auto-navigate on dev server detection)
   useEffect(() => {

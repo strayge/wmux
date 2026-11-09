@@ -5,6 +5,7 @@ import { create } from 'zustand';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AgentViewerBridge, AgentViewerEvent, PaneId, SplitNode, SurfaceId, SurfaceRef } from '../../src/shared/types';
 import BrowserPane from '../../src/renderer/components/Browser/BrowserPane';
+import { beginAgentBrowserHandoff, clearAgentBrowserHandoff } from '../../src/renderer/store/agent-browser-handoff';
 import SplitPreviewOverlay from '../../src/renderer/components/SplitPane/SplitPreviewOverlay';
 import SurfaceTabBar from '../../src/renderer/components/SplitPane/SurfaceTabBar';
 
@@ -54,6 +55,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   act(() => root.unmount());
+  clearAgentBrowserHandoff('surf-b');
   container.remove();
   for (const key of Object.keys(webviewApi)) delete (HTMLElement.prototype as unknown as Record<string, unknown>)[key];
   delete (window as unknown as { wmux?: unknown }).wmux;
@@ -183,6 +185,7 @@ describe('BrowserPane in agent mode', () => {
     const render = (engine: 'agent' | 'web') => act(() => root.render(React.createElement(BrowserPane, { surfaceId: 'surf-b', initialUrl: PAGE, engine, onTitleChange })));
     render('agent');
     await settle();
+    beginAgentBrowserHandoff('surf-b');
     render('web');
     await settle();
     expect(onTitleChange).toHaveBeenLastCalledWith('Page A');
@@ -195,6 +198,7 @@ describe('BrowserPane in agent mode', () => {
     const render = (engine: 'agent' | 'web') => act(() => root.render(React.createElement(BrowserPane, { surfaceId: 'surf-b', initialUrl: PAGE, engine, onTitleChange })));
     render('agent');
     await settle();
+    beginAgentBrowserHandoff('surf-b');
     render('web');
     await settle();
     expect(onTitleChange).toHaveBeenLastCalledWith('');
