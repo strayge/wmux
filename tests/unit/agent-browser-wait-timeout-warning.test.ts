@@ -24,6 +24,7 @@ vi.mock('../../src/main/ipc-handlers', () => ({
   },
 }));
 vi.mock('../../src/main/agent-browser-runtime', () => ({
+  runAgentBrowserForSession: vi.fn(),
   acquireDashboardFor: async () => {},
   sessionRegistry: {
     ensure: (surfaceId: string) => ({

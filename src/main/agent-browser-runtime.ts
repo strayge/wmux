@@ -19,6 +19,7 @@ import * as net from 'net';
 import { AGENT_BROWSER_STREAM_DEFAULTS, nativeCaptureArgs } from './agent-browser-capture';
 import { agentBrowserPath, runAgentBrowser, unwrapAgentData, type RunResult } from './agent-browser-cli';
 import { DashboardDaemon } from './agent-browser-daemon';
+import { AgentBrowserControl, type AgentBrowserControlDeps, type NativeCommandCheck, type NativeCommandRunner } from './agent-browser-control';
 import {
   DASHBOARD_PORT,
   isWmuxSessionName,
@@ -65,6 +66,128 @@ const DASHBOARD_STOP_TIMEOUT_MS = 10_000;
 
 /** surfaceId → agent-browser session. See `agent-browser-session.ts`. */
 export const sessionRegistry = new SessionRegistry();
+
+// Controls outlive viewer subscriptions and remain available for a failed-close retry.
+const sessionControls = new Map<SurfaceId, { session: AgentSession; control: AgentBrowserControl }>();
+let reportControlPause: ((id: SurfaceId, message: string) => void) | undefined;
+
+/** The single viewer bridge observes failures from either UI or pipe commands. */
+export function setAgentControlPauseReporter(reporter: (id: SurfaceId, message: string) => void): void {
+  reportControlPause = reporter;
+}
+
+/** Only a deliberate successful launch may establish a new identity baseline. */
+export async function initializeAgentBrowserControl(
+  session: AgentSession,
+  binary: string,
+  deps?: AgentBrowserControlDeps,
+): Promise<void> {
+  if (sessionControls.has(session.surfaceId)) throw new Error('The previous browser session has not been closed. Retry Start new session.');
+  const control = new AgentBrowserControl(session, binary, {
+    ...deps,
+    onPause: (message) => {
+      if (sessionRegistry.get(session.surfaceId) === session && sessionControls.get(session.surfaceId)?.control === control) {
+        reportControlPause?.(session.surfaceId, message);
+      }
+      deps?.onPause?.(message);
+    },
+  });
+  sessionControls.set(session.surfaceId, { session, control });
+  await control.initialize();
+}
+
+/** UI input, multi-step tab actions and pipe commands share one receive-order queue. */
+export function withAgentSessionWork<T>(
+  session: AgentSession,
+  work: (run: NativeCommandRunner) => T | Promise<T>,
+  timeoutMs?: number,
+): Promise<T> {
+  const entry = sessionControls.get(session.surfaceId);
+  const checkSession = (): void => {
+    if (entry?.session !== session || getStartedSession(session.surfaceId) !== session
+      || sessionControls.get(session.surfaceId) !== entry) throw new Error('Browser session is no longer available.');
+  };
+  try { checkSession(); } catch (error) { return Promise.reject(error); }
+  return entry!.control.enqueue((run) => {
+    checkSession();
+    return work((argv, timeout, check) => run(argv, timeout, async () => {
+      checkSession();
+      await check?.();
+      checkSession();
+    }));
+  }, timeoutMs);
+}
+
+export function runAgentSessionCommand(session: AgentSession, argv: string[], timeoutMs: number): Promise<RunResult> {
+  return withAgentSessionWork(session, (run) => run(argv, timeoutMs), timeoutMs);
+}
+
+/** Recovery checks identity; it never replays the command whose outcome is unknown. */
+export async function resumeAgentSessionCommands(session: AgentSession, check: NativeCommandCheck): Promise<void> {
+  const entry = sessionControls.get(session.surfaceId);
+  if (entry?.session !== session) throw new Error('Browser session identity is unavailable. Start a new session.');
+  await entry.control.resume(async () => {
+    if (getStartedSession(session.surfaceId) !== session || sessionControls.get(session.surfaceId) !== entry) {
+      throw new Error('Browser session changed before recovery.');
+    }
+    await check();
+    if (getStartedSession(session.surfaceId) !== session || sessionControls.get(session.surfaceId) !== entry) {
+      throw new Error('Browser session changed during recovery.');
+    }
+  });
+}
+
+/** The argv adapter is for the existing V2 verb table, not an unguarded native fallback. */
+export function runAgentBrowserForSession(argv: string[], timeoutMs: number): Promise<RunResult> {
+  const entry = argv[0] === '--session'
+    ? [...sessionControls.values()].find(({ session }) => session.sessionName === argv[1]) : undefined;
+  if (!entry) return Promise.reject(new Error('Browser session identity is unavailable. Start a new session.'));
+  return runAgentSessionCommand(entry.session, argv.slice(2), timeoutMs);
+}
+
+/** Bootstrap and orphan cleanup stay explicit; ordinary session calls require a control. */
+export async function runManagedAgentBrowser(
+  binary: string,
+  argv: string[],
+  timeoutMs = 60_000,
+  env?: NodeJS.ProcessEnv,
+): Promise<RunResult> {
+  if (argv[0] !== '--session') return runAgentBrowser(binary, argv, timeoutMs, env);
+  const entry = [...sessionControls.values()].find(({ session }) => session.sessionName === argv[1]);
+  if (env?.AGENT_BROWSER_STREAM_PORT !== undefined) {
+    if (entry) throw new Error('The previous browser session has not been closed. Retry Start new session.');
+    return runAgentBrowser(binary, argv, timeoutMs, env);
+  }
+  const command = argv.slice(argv[2] === '--json' ? 3 : 2);
+  if (command.length === 1 && command[0] === 'close') {
+    if (!entry) {
+      if (!isWmuxSessionName(argv[1])) throw new Error('Refusing to close an unowned browser session.');
+      return runAgentBrowser(binary, argv, timeoutMs, env);
+    }
+    const forgetClosed = (): void => {
+      if (sessionControls.get(entry.session.surfaceId) !== entry) return;
+      entry.control.dispose();
+      sessionControls.delete(entry.session.surfaceId);
+    };
+    const pending: RunResult = { ok: false, spawnFailed: false, data: null, stdout: '',
+      stderr: 'Browser close is still pending. Retry Start new session after the current command finishes.' };
+    const closing = entry.control.close(timeoutMs).catch((error: unknown) => ({ ...pending,
+      stderr: error instanceof Error ? error.message : String(error) }));
+    // Caller waiting is bounded, but an explicit close must survive queue wait.
+    // A fresh-start retry retains the completed result while it still owns the record.
+    void closing.then((result) => {
+      if (result.ok && sessionRegistry.get(entry.session.surfaceId) !== entry.session) forgetClosed();
+    });
+    const result = await withDeadline(closing, timeoutMs, pending);
+    if (result.ok) forgetClosed();
+    return result;
+  }
+  if (!entry) throw new Error('Browser session identity is unavailable. Start a new session.');
+  if (command.length === 2 && command[0] === 'get' && command[1] === 'url') {
+    return entry.control.readback(Math.min(timeoutMs, SESSION_CLOSE_TIMEOUT_MS));
+  }
+  return runAgentSessionCommand(entry.session, command, timeoutMs);
+}
 
 /**
  * Is something already listening on the dashboard port?
@@ -577,7 +700,7 @@ export async function reconcileOrphanSessions(
  */
 export const agentBrowserTeardownDeps: AgentBrowserTeardownDeps = {
   binary: () => agentBrowserPath(),
-  run: (binary, argv, timeoutMs) => runAgentBrowser(binary, argv, timeoutMs),
+  run: (binary, argv, timeoutMs) => runManagedAgentBrowser(binary, argv, timeoutMs),
   listSessions: () => sessionRegistry.all(),
   forgetSession: (surfaceId) => releaseAgentSession(surfaceId),
   hasSession: (surfaceId) => sessionRegistry.get(surfaceId) !== undefined,
@@ -609,6 +732,7 @@ export interface AgentBrowserStartupDeps {
   getSession: (id: SurfaceId) => AgentSession | undefined;
   releaseSession?: (id: SurfaceId) => AgentSession | undefined;
   captureArgs?: () => string[];
+  initializeControl?: (session: AgentSession, binary: string) => Promise<void>;
   run: (binary: string, argv: string[], env?: NodeJS.ProcessEnv) => Promise<RunResult>;
 }
 
@@ -620,7 +744,8 @@ const startupDeps: AgentBrowserStartupDeps = {
   ensureSession: ensureBindableSession,
   getSession: (id) => sessionRegistry.get(id),
   releaseSession: (id) => sessionRegistry.release(id),
-  run: (binary, argv, env) => runAgentBrowser(binary, argv, undefined, env),
+  run: (binary, argv, env) => runManagedAgentBrowser(binary, argv, undefined, env),
+  initializeControl: initializeAgentBrowserControl,
 };
 
 /** A registry record allocates a name, not readiness; UI and CLI join this launch. */
@@ -650,16 +775,26 @@ export function ensureStartedSession(
       if (deps.getSession(id) === session) deps.releaseSession?.(id);
       throw new Error('Browser startup cancelled');
     }
-    const res = await deps.run(binary,
-      ['--session', session.sessionName, '--pin-tab', ...(deps.captureArgs ?? nativeCaptureArgs)(), 'open', ...(url && url !== 'about:blank' ? [url] : [])],
-      { ...AGENT_BROWSER_STREAM_DEFAULTS, AGENT_BROWSER_STREAM_PORT: String(session.streamPort) });
-    if (launch.cancelled || deps.getSession(id) !== session) {
+    const closeCancelled = async (): Promise<never> => {
       const closed = await deps.run(binary, ['--session', session.sessionName, 'close']).catch(() => null);
       launch.closed = closed?.ok === true;
       if (!launch.closed) launch.closeError = closed?.stderr.trim() || 'Could not close the cancelled browser startup. Retry Start new session.';
       throw new Error('Browser startup cancelled');
-    }
+    };
+    const res = await deps.run(binary,
+      ['--session', session.sessionName, '--pin-tab', ...(deps.captureArgs ?? nativeCaptureArgs)(), 'open', ...(url && url !== 'about:blank' ? [url] : [])],
+      { ...AGENT_BROWSER_STREAM_DEFAULTS, AGENT_BROWSER_STREAM_PORT: String(session.streamPort) });
+    if (launch.cancelled || deps.getSession(id) !== session) return closeCancelled();
     if (!res.ok) throw new Error(res.stderr.trim() || res.stdout.trim() || 'agent-browser startup failed');
+    try {
+      await deps.initializeControl?.(session, binary);
+    } catch (error) {
+      if (launch.cancelled || deps.getSession(id) !== session) return closeCancelled();
+      // Chrome opened, but control is paused. A remount must not launch it again.
+      started.set(id, session);
+      throw error;
+    }
+    if (launch.cancelled || deps.getSession(id) !== session) return closeCancelled();
     started.set(id, session);
     return session;
   }).finally(() => {
@@ -696,6 +831,7 @@ export function getStartedSession(id: SurfaceId): AgentSession | undefined {
 export function cancelAgentStartup(id: SurfaceId): void {
   const pending = starting.get(id);
   if (pending) pending.cancelled = true;
+  sessionControls.get(id)?.control.cancelPending();
   started.delete(id);
 }
 

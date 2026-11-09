@@ -22,8 +22,8 @@
 import * as fs from 'fs';
 import { BrowserWindow } from 'electron';
 import { cdpBridge } from './ipc-handlers';
-import { agentBrowserPath, runAgentBrowser, unwrapAgentData, type RunResult } from './agent-browser-cli';
-import { acquireDashboardFor, ensureStartedSession, withDeadline } from './agent-browser-runtime';
+import { unwrapAgentData, type RunResult } from './agent-browser-cli';
+import { acquireDashboardFor, ensureStartedSession, runAgentBrowserForSession, withDeadline } from './agent-browser-runtime';
 import type { AgentSession } from './agent-browser-session';
 import { toAgentBrowserArgv } from './agent-browser-verbs';
 import { keepRenderingLeases } from './browser-keep-rendering';
@@ -575,13 +575,7 @@ function agentTimeoutFor(method: string, params: any): number {
 /** The real machine behind `BrowserDeps`. Every production call uses this. */
 const defaultDeps: BrowserDeps = {
   bridge: cdpBridge,
-  runAgent: async (argv, timeoutMs) => {
-    const binary = agentBrowserPath();
-    if (!binary) {
-      throw new Error('agent-browser is not installed — open a browser tab in agent mode to install it');
-    }
-    return runAgentBrowser(binary, argv, timeoutMs);
-  },
+  runAgent: runAgentBrowserForSession,
   keepRendering: async (wcId) => keepRenderingLeases.touch(wcId, cdpBridge.surfaceIdFor(wcId)),
 };
 

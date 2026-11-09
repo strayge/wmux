@@ -42,6 +42,10 @@ vi.mock('../../src/main/agent-browser-cli', async (importOriginal) => ({
 }));
 vi.mock('../../src/main/agent-browser-runtime', async (importOriginal) => ({
   withDeadline: (await importOriginal<typeof import('../../src/main/agent-browser-runtime')>()).withDeadline,
+  runAgentBrowserForSession: (argv: string[], timeoutMs: number) => {
+    env.nativeCalls.push({ argv, timeoutMs });
+    return env.nativeImpl(argv, timeoutMs);
+  },
   acquireDashboardFor: (surfaceId: string) => {
     env.acquired.push(surfaceId);
     return env.acquireImpl(surfaceId);

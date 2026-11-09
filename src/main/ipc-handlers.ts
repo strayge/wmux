@@ -74,7 +74,7 @@ import {
 import { grantFilePath, isFilePathGranted } from './file-grants';
 import { readMarkdownImage } from './markdown-image';
 import { getAwakeManager, isKeepAwakeMode } from './awake-manager';
-import { agentBrowserPath, runAgentBrowser, unwrapAgentData, observedBrowserReplacement, type RunResult } from './agent-browser-cli';
+import { agentBrowserPath, unwrapAgentData, observedBrowserReplacement, type RunResult } from './agent-browser-cli';
 // The process-wide singletons. Constructing a second SessionRegistry or
 // DashboardDaemon here would hand the same stream port to two surfaces and let
 // either daemon stop the dashboard out from under the other — see the header of
@@ -86,6 +86,8 @@ import {
   dashboardDaemon,
   ensureBindableSession,
   ensureStartedSession,
+  initializeAgentBrowserControl,
+  runManagedAgentBrowser,
   withAgentSessionTeardown,
   SESSION_CLOSE_TIMEOUT_MS,
   releaseDashboardFor,
@@ -457,6 +459,7 @@ export interface AgentBrowserDeps {
   ensureSession: (surfaceId: SurfaceId) => AgentSession | Promise<AgentSession>;
   getSession: (surfaceId: SurfaceId) => AgentSession | undefined;
   releaseSession: (surfaceId: SurfaceId) => AgentSession | undefined;
+  initializeControl?: (session: AgentSession, binary: string) => Promise<void>;
 }
 
 /**
@@ -613,7 +616,8 @@ export async function disableAgentBrowser(
  */
 const agentBrowserDeps: AgentBrowserDeps = {
   binary: () => agentBrowserPath(),
-  run: (binary, argv, env) => runAgentBrowser(binary, argv, argv.at(-1) === 'close' ? SESSION_CLOSE_TIMEOUT_MS : undefined, env),
+  run: (binary, argv, env) => runManagedAgentBrowser(binary, argv, argv.at(-1) === 'close' ? SESSION_CLOSE_TIMEOUT_MS : undefined, env),
+  initializeControl: initializeAgentBrowserControl,
   acquireDashboard: (surfaceId) => acquireDashboardFor(surfaceId),
   releaseDashboard: (surfaceId) => releaseDashboardFor(surfaceId),
   // UI enable joins the same bindable startup as CLI-first routing.

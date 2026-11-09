@@ -6,11 +6,15 @@
 import WebSocket from 'ws';
 import { AGENT_BROWSER_CAPTURE_SCALE } from './agent-browser-capture';
 import type { AgentSession } from './agent-browser-session';
-import { agentBrowserPath, runAgentBrowser, unwrapAgentData, observedBrowserReplacement, type RunResult } from './agent-browser-cli';
-import { getStartedSession } from './agent-browser-runtime';
+import { unwrapAgentData, observedBrowserReplacement, type RunResult } from './agent-browser-cli';
+import { getStartedSession, resumeAgentSessionCommands, runAgentSessionCommand, setAgentControlPauseReporter, withAgentSessionWork } from './agent-browser-runtime';
 import type { AgentBrowserTab, AgentViewerAction, AgentViewerEvent, AgentViewerInput, AgentViewerMessage, SurfaceId } from '../shared/types';
 
+type ViewerNativeRun = (argv: string[], check?: () => void) => Promise<RunResult>;
+
 export interface ViewerDeps {
+  schedule?: (session: AgentSession, work: (run: ViewerNativeRun) => void | Promise<void>) => Promise<void>;
+  resume?: (session: AgentSession, check: () => Promise<void>) => Promise<void>;
   session: (id: SurfaceId) => AgentSession | undefined;
   connect: (url: string) => WebSocket;
   run: (session: AgentSession, argv: string[]) => Promise<RunResult>;
@@ -129,10 +133,20 @@ export class AgentBrowserViewer {
       await authorize();
       if (this.attaching.get(key) !== intent) return;
       if (previousToken !== undefined) {
-        if (this.leases.get(surfaceId) !== lease || this.paused.get(surfaceId) !== failure
-          || this.deps.session(surfaceId) !== recoverySession) throw new Error('Stale viewer recovery');
-        if (failure?.restart) throw new Error(failure.message);
+        const checkRecovery = (): void => {
+          if (this.attaching.get(key) !== intent || this.leases.get(surfaceId) !== lease
+            || this.paused.get(surfaceId) !== failure || this.deps.session(surfaceId) !== recoverySession) {
+            throw new Error('Stale viewer recovery');
+          }
+          if (failure?.restart) throw new Error(failure.message);
+        };
+        checkRecovery();
         if (!recoverySession) throw new Error('Browser session is unavailable. Start a new session.');
+        await this.deps.resume?.(recoverySession, async () => {
+          await authorize();
+          checkRecovery();
+        });
+        checkRecovery();
         this.paused.delete(surfaceId);
       }
       try { this.attach(surfaceId, owner, token, emit); }
@@ -300,18 +314,22 @@ export class AgentBrowserViewer {
   }
 
   /** Native mutations and stream input share receive order and stale-work fences. */
-  private enqueue(sub: Subscription, revision: number, requireFrame: boolean, work: () => void | Promise<void>): Promise<void> {
+  private enqueue(sub: Subscription, revision: number, requireFrame: boolean, work: (run: ViewerNativeRun) => void | Promise<void>): Promise<void> {
     if (sub.queued >= MAX_QUEUED_WORK) {
       if (this.current(sub) && sub.revision === revision) this.fail(sub, 'Page input queue is full. Input has been paused.');
       return Promise.reject(new Error('Page input queue is full'));
     }
     sub.queued++;
     const workRevision = sub.workRevision;
-    const run = sub.queue.then(() => {
+    const execute = (native: ViewerNativeRun) => {
       if (!this.current(sub) || !sub.ready || sub.revision !== revision || sub.workRevision !== workRevision) throw new Error('Stale page action');
       if (requireFrame && (!sub.visible || sub.presentedRevision !== revision)) throw new Error('Page frame is not presented');
-      return work();
-    }).finally(() => { sub.queued--; });
+      return work(native);
+    };
+    const pending = this.deps.schedule
+      ? this.deps.schedule(sub.session, execute)
+      : sub.queue.then(() => execute(async (argv, check) => { check?.(); return this.deps.run(sub.session, argv); }));
+    const run = pending.finally(() => { sub.queued--; });
     sub.queue = run.catch(() => {});
     return run;
   }
@@ -357,7 +375,7 @@ export class AgentBrowserViewer {
     if (requireFrame && (!sub.visible || sub.tabOperation || sub.presentedRevision !== revision)) throw new Error('Page frame is not presented');
     if (action.type === 'tab-new' || action.type === 'tab-select' || action.type === 'tab-close') {
       if (action.type !== 'tab-new' && (typeof action.tabId !== 'string' || !/^t[1-9]\d{0,15}$/.test(action.tabId))) throw new Error('Invalid tab ID');
-      return this.enqueue(sub, revision, false, () => this.tabAction(sub, action));
+      return this.enqueue(sub, revision, false, (run) => this.tabAction(sub, action, run));
     }
     let argv: string[];
     switch (action.type) {
@@ -378,12 +396,17 @@ export class AgentBrowserViewer {
       default: throw new Error('Invalid page action');
     }
     const workRevision = sub.workRevision;
-    return this.enqueue(sub, revision, requireFrame, async () => {
-      if (action.type === 'viewport' && !sub.visible) throw new Error('Page is hidden');
+    return this.enqueue(sub, revision, requireFrame, async (run) => {
+      const check = (): void => {
+        if (!this.current(sub) || !sub.ready || sub.revision !== revision || sub.workRevision !== workRevision) throw new Error('Stale page action');
+        if (requireFrame && (!sub.visible || sub.presentedRevision !== revision)) throw new Error('Page frame is not presented');
+        if (action.type === 'viewport' && !sub.visible) throw new Error('Page is hidden');
+      };
       let res: RunResult;
-      try { res = await this.deps.run(sub.session, argv); }
+      try { res = await run(argv, check); }
       catch (err) {
-        this.fail(sub, 'Native page action could not be launched.');
+        try { check(); } catch { throw err; }
+        this.fail(sub, err instanceof Error ? err.message : 'Native page action could not be launched.');
         throw err;
       }
       this.checkNativeResult(sub, res);
@@ -404,7 +427,7 @@ export class AgentBrowserViewer {
   }
 
   /** A close always addresses the original ID, after a safe active replacement. */
-  private async tabAction(sub: Subscription, action: Extract<AgentViewerAction, { type: 'tab-new' | 'tab-select' | 'tab-close' }>): Promise<void> {
+  private async tabAction(sub: Subscription, action: Extract<AgentViewerAction, { type: 'tab-new' | 'tab-select' | 'tab-close' }>, native: ViewerNativeRun): Promise<void> {
     const ids = sub.tabs.map((tab) => tab.tabId);
     if (action.type !== 'tab-new' && !ids.includes(action.tabId)) throw new Error('Tab is no longer available');
     const closing = action.type === 'tab-close' ? action.tabId : undefined;
@@ -427,8 +450,12 @@ export class AgentBrowserViewer {
     const run = async (argv: string[]) => {
       check();
       let result: RunResult;
-      try { result = await this.deps.run(sub.session, argv); }
-      catch (err) { this.fail(sub, 'Native tab action could not be launched.'); throw err; }
+      try { result = await native(argv, check); }
+      catch (err) {
+        try { check(); } catch { throw err; }
+        this.fail(sub, err instanceof Error ? err.message : 'Native tab action could not be launched.');
+        throw err;
+      }
       this.checkNativeResult(sub, result);
       check();
       if (!result.ok) throw new Error(result.stderr.trim() || 'Native tab action failed.');
@@ -480,6 +507,14 @@ export class AgentBrowserViewer {
     }
   }
 
+  /** Pipe-command failures must pause the same viewer, including while it is detached. */
+  pauseCommands(id: SurfaceId, message: string): void {
+    if (this.paused.get(id)?.restart) return;
+    const sub = this.subscriptions.get(id);
+    if (sub) this.fail(sub, message);
+    else this.paused.set(id, { message });
+  }
+
   canAct(id: SurfaceId): boolean { return !this.paused.has(id); }
 
   /** Dashboard enable may reuse a ready session, but cannot start through a failed close. */
@@ -523,14 +558,14 @@ export class AgentBrowserViewer {
 }
 
 export function createAgentBrowserViewer(clipboard: Pick<ViewerDeps, 'readClipboard' | 'writeClipboard'>): AgentBrowserViewer {
-  return new AgentBrowserViewer({
+  const viewer = new AgentBrowserViewer({
     ...clipboard,
     session: getStartedSession,
     connect: (url) => new WebSocket(url, { maxPayload: 12 * 1024 * 1024, handshakeTimeout: 5000 }),
-    run: async (session, argv) => {
-      const binary = agentBrowserPath();
-      if (!binary) throw new Error('agent-browser is not installed');
-      return runAgentBrowser(binary, ['--session', session.sessionName, '--json', ...argv], 10000);
-    },
+    run: (session, argv) => runAgentSessionCommand(session, argv, 10000),
+    schedule: (session, work) => withAgentSessionWork(session, (run) => work((argv, check) => run(argv, 10000, check))),
+    resume: resumeAgentSessionCommands,
   });
+  setAgentControlPauseReporter((id, message) => viewer.pauseCommands(id, message));
+  return viewer;
 }

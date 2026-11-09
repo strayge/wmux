@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { describe, it, expect, vi } from 'vitest';
 import type WebSocket from 'ws';
-import { AgentBrowserViewer, validatedViewerInput } from '../../src/main/agent-browser-viewer';
+import { AgentBrowserViewer, validatedViewerInput, type ViewerDeps } from '../../src/main/agent-browser-viewer';
 import type { AgentViewerEvent, SurfaceId } from '../../src/shared/types';
 import protocol from '../fixtures/agent-browser/viewer-protocol.json';
 
@@ -9,7 +9,7 @@ const ID = 'surf-viewer' as SurfaceId;
 const SESSION = { surfaceId: ID, sessionName: 'wmux-surf-viewer', streamPort: 9301, dashboardUrl: 'unused' };
 const ok = { ok: true, spawnFailed: false, data: { result: 'Selected 漢字' }, stdout: '', stderr: '' };
 
-function harness() {
+function harness(control: Pick<ViewerDeps, 'schedule' | 'resume'> = {}) {
   const sockets: Array<EventEmitter & { readyState: number; bufferedAmount: number; send: ReturnType<typeof vi.fn>; terminate: ReturnType<typeof vi.fn> }> = [];
   const run = vi.fn(async (_session: typeof SESSION, _argv: string[]) => ok);
   const events: AgentViewerEvent[] = [];
@@ -22,7 +22,7 @@ function harness() {
   const readClipboard = vi.fn(() => 'Pasted 漢字');
   let session: typeof SESSION | undefined = SESSION;
   const viewer = new AgentBrowserViewer({ connect, run, session: () => session,
-    readClipboard, writeClipboard });
+    readClipboard, writeClipboard, ...control });
   viewer.attach(ID, 10, 'token-a', (event) => events.push(event));
   const receive = (message: unknown, index = sockets.length - 1) => sockets[index].emit('message', JSON.stringify(message));
   receive(protocol.status);
@@ -188,6 +188,83 @@ describe('surface stream subscriptions', () => {
     await expect(h.viewer.action(ID, 10, 'recovered', 1, { type: 'paste' })).rejects.toThrow('frame');
   });
 
+  it('waits for an explicit checked resume before reconnecting the stream', async () => {
+    let complete!: () => void;
+    const barrier = new Promise<void>((resolve) => { complete = resolve; });
+    const resume = vi.fn(async (_session, check: () => Promise<void>) => { await check(); await barrier; await check(); });
+    const h = harness({ resume });
+    h.viewer.pauseCommands(ID, 'Command outcome is unknown');
+    const recovery = h.viewer.attachAuthorized(ID, 10, 'recovering', async () => {}, () => {}, 'token-a');
+    await vi.waitFor(() => expect(resume).toHaveBeenCalledOnce());
+    expect(h.connect).toHaveBeenCalledOnce();
+    expect(h.viewer.canAct(ID)).toBe(false);
+    complete();
+    await recovery;
+    expect(h.connect).toHaveBeenCalledTimes(2);
+    expect(h.viewer.canAct(ID)).toBe(true);
+    expect(h.run).not.toHaveBeenCalled();
+  });
+
+  it.each(['authorization', 'detach', 'session'])('does not clear a command pause when %s changes during the resume barrier', async (change) => {
+    let complete!: () => void;
+    const barrier = new Promise<void>((resolve) => { complete = resolve; });
+    const resume = vi.fn(async (_session, check: () => Promise<void>) => { await check(); await barrier; await check(); });
+    const h = harness({ resume });
+    h.viewer.pauseCommands(ID, 'Command outcome is unknown');
+    let authorized = true;
+    const recovery = h.viewer.attachAuthorized(ID, 10, 'recovering', async () => {
+      if (!authorized) throw new Error('Unauthorized');
+    }, () => {}, 'token-a');
+    await vi.waitFor(() => expect(resume).toHaveBeenCalledOnce());
+    if (change === 'authorization') authorized = false;
+    if (change === 'detach') h.viewer.detach(ID, 10, 'recovering');
+    if (change === 'session') h.replaceSession();
+    complete();
+    await expect(recovery).rejects.toThrow();
+    expect(h.viewer.canAct(ID)).toBe(false);
+    expect(h.connect).toHaveBeenCalledOnce();
+  });
+
+  it('submits native actions and stream input immediately to the shared queue in receive order', async () => {
+    let release!: () => void;
+    let shared = new Promise<void>((resolve) => { release = resolve; });
+    const schedule = vi.fn<NonNullable<ViewerDeps['schedule']>>((_session, work) => {
+      const next = shared.then(() => work(async (argv, check) => { check?.(); return h.run(SESSION, argv); }));
+      shared = next.catch(() => {});
+      return next;
+    });
+    const h = harness({ schedule });
+    h.present();
+    const action = h.viewer.action(ID, 10, 'token-a', 1, { type: 'reload' });
+    const input = h.viewer.input(ID, 10, 'token-a', 1, key);
+    expect(schedule).toHaveBeenCalledTimes(2);
+    expect(h.run).not.toHaveBeenCalled();
+    expect(h.sockets[0].send).not.toHaveBeenCalled();
+    release();
+    await Promise.all([action, input]);
+    expect(h.run).toHaveBeenCalledExactlyOnceWith(SESSION, ['reload']);
+    expect(h.sockets[0].send).toHaveBeenCalledOnce();
+    expect(JSON.parse(h.sockets[0].send.mock.calls[0][0])).toEqual(key);
+  });
+
+  it('rechecks page intent after asynchronous control preflight without pausing the newer view', async () => {
+    let release!: () => void;
+    const preflight = new Promise<void>((resolve) => { release = resolve; });
+    const schedule: NonNullable<ViewerDeps['schedule']> = (_session, work) => Promise.resolve(work(async (argv, check) => {
+      await preflight;
+      check?.();
+      return h.run(SESSION, argv);
+    }));
+    const h = harness({ schedule });
+    h.present();
+    const action = h.viewer.action(ID, 10, 'token-a', 1, { type: 'paste' });
+    await h.viewer.action(ID, 10, 'token-a', 1, { type: 'visibility', visible: false });
+    release();
+    await expect(action).rejects.toThrow('Stale');
+    expect(h.run).not.toHaveBeenCalled();
+    expect(h.viewer.canAct(ID)).toBe(true);
+  });
+
   it.each(['unauthorized', 'detach', 'teardown', 'newer-attach'])('does not let %s recovery clear a pause or affect later subscriptions', async (mode) => {
     const h = harness();
     h.receive({ ...protocol.status, connected: false });
@@ -256,6 +333,7 @@ describe('surface stream subscriptions', () => {
     h.receive({ ...protocol.status, connected: false });
     expect(h.viewer.canEnable(ID)).toBe(true);
     const complete = h.viewer.pauseForRestart(ID);
+    h.viewer.pauseCommands(ID, 'A late command failed');
     expect(h.viewer.canEnable(ID)).toBe(false);
     expect(h.viewer.canAct(ID)).toBe(false);
     expect(() => h.viewer.attach(ID, 10, 'remount', () => {})).toThrow('Close the previous');

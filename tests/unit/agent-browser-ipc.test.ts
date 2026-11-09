@@ -95,6 +95,26 @@ vi.mock('../../src/main/agent-browser-capture', async (importOriginal) => ({
   nativeCaptureArgs: () => ['--args', '--force-device-scale-factor=2'],
 }));
 
+/** Ownership/handoff tests isolate transport; control guards have their own suite. */
+vi.mock('../../src/main/agent-browser-control', async () => {
+  const cli = await import('../../src/main/agent-browser-cli');
+  return { AgentBrowserControl: class {
+    constructor(private session: { sessionName: string }, private binary: string) {}
+    async initialize() {}
+    async enqueue<T>(work: (run: (argv: string[], timeout?: number, check?: () => void | Promise<void>) => Promise<import('../../src/main/agent-browser-cli').RunResult>) => T | Promise<T>) {
+      return work(async (argv, timeout, check) => {
+        await check?.();
+        return cli.runAgentBrowser(this.binary, ['--session', this.session.sessionName, '--json', ...argv], timeout);
+      });
+    }
+    async resume(check?: () => void | Promise<void>) { await check?.(); }
+    close(timeout: number) { return cli.runAgentBrowser(this.binary, ['--session', this.session.sessionName, 'close'], timeout); }
+    readback(timeout: number) { return cli.runAgentBrowser(this.binary, ['--session', this.session.sessionName, '--json', 'get', 'url'], timeout); }
+    cancelPending() {}
+    dispose() {}
+  } };
+});
+
 import { initPipeBridge } from '../../src/renderer/pipe-bridge';
 import {
   authorizeAgentBrowserSurface,
@@ -409,6 +429,7 @@ describe('browser sender ownership', () => {
       await ensureStartedSession(id, undefined, {
         binary: () => 'native.exe', ensureSession: (id) => runtime.sessionRegistry.ensure(id),
         getSession: (id) => runtime.sessionRegistry.get(id), run: async () => okRun(),
+        initializeControl: runtime.initializeAgentBrowserControl,
       });
       registerIpcHandlers(h.manager as any);
       await registeredIpc.handles.get(IPC_CHANNELS.AGENT_VIEWER_ATTACH)!(h.event, id, 'owned');
@@ -445,6 +466,7 @@ describe('browser sender ownership', () => {
       await ensureStartedSession(id, undefined, {
         binary: () => 'native.exe', ensureSession: (id) => runtime.sessionRegistry.ensure(id),
         getSession: (id) => runtime.sessionRegistry.get(id), run: async () => okRun(),
+        initializeControl: runtime.initializeAgentBrowserControl,
       });
       registerIpcHandlers(h.manager as any);
       const handler = (channel: string) => registeredIpc.handles.get(channel)!;

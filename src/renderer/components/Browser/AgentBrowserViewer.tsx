@@ -169,7 +169,7 @@ export default function AgentBrowserViewer({ surfaceId, visible, focused, onActi
       setHasFrame(false);
       setConnected(false);
       callbacks.current.onConnection?.(false);
-      // The stream's initial status/tabs/URL are authoritative; never issue a native read/open.
+      // Main checks uncertain CLI work when needed; the new stream supplies page state.
       void api.reconnect(surfaceId, previousToken, token).then(() => {
         if (!disposed && (!isVisible.current || document.hidden)) syncVisibility();
       }).catch((err) => {

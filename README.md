@@ -89,7 +89,7 @@ Open a local development server or documentation in the browser panel with **Ctr
 
 In a browser tab, **Agent** mode shows the Chrome page you and your agent control together. Use **…** for **New tab** or **Show dashboard**; returning to Page keeps the same session.
 
-If Page pauses after a connection failure, choose **Reconnect / Continue**, or **Start new session** to close the old session and open a blank page. Native browser commands can still restart Chrome or leave duplicate daemons; wmux does not prevent those restarts or guarantee cleanup of undetected duplicates.
+If Page pauses, choose **Reconnect / Continue**. After an uncertain browser command, wmux checks the existing session before resuming and never replays that command. **Start new session** closes the old session and opens a blank page. Viewer and `wmux browser` commands share a queue and pause on detected identity changes, but native commands can still restart Chrome or leave duplicate daemons; wmux does not prevent every restart or guarantee cleanup of undetected duplicates.
 
 Links can open in wmux or your system browser; choose the default in **Settings → Browser**.
 

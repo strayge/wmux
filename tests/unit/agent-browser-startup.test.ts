@@ -36,6 +36,42 @@ describe('shared UI/CLI startup', () => {
     expect(h.captureArgs).toHaveBeenCalledOnce();
   });
 
+  it('does not expose a startup until its control identity is captured', async () => {
+    const h = harness();
+    let complete!: () => void;
+    h.deps.initializeControl = vi.fn(() => new Promise<void>((resolve) => { complete = resolve; }));
+    const startup = ensureStartedSession(ID, undefined, h.deps);
+    await vi.waitFor(() => expect(h.deps.initializeControl).toHaveBeenCalledOnce());
+    let ready = false;
+    void startup.then(() => { ready = true; });
+    expect(ensureStartedSession(ID, undefined, h.deps)).toBe(startup);
+    expect(ready).toBe(false);
+    complete();
+    await startup;
+    expect(h.run).toHaveBeenCalledOnce();
+  });
+
+  it('does not reopen Chrome when identity capture fails after a successful launch', async () => {
+    const h = harness();
+    h.deps.initializeControl = vi.fn(async () => { throw new Error('Identity unavailable'); });
+    await expect(ensureStartedSession(ID, undefined, h.deps)).rejects.toThrow('Identity unavailable');
+    expect(await ensureStartedSession(ID, undefined, h.deps)).toBe(h.registry.get(ID));
+    expect(h.run).toHaveBeenCalledOnce();
+    expect(h.deps.initializeControl).toHaveBeenCalledOnce();
+  });
+
+  it('closes a cancelled startup after its identity inspection settles', async () => {
+    const h = harness();
+    let complete!: () => void;
+    h.deps.initializeControl = () => new Promise<void>((resolve) => { complete = resolve; });
+    const startup = ensureStartedSession(ID, undefined, h.deps);
+    await vi.waitFor(() => expect(complete).toBeTypeOf('function'));
+    releaseAgentSession(ID);
+    complete();
+    await expect(startup).rejects.toThrow('cancelled');
+    expect(h.run.mock.calls.map((call) => call[1].at(-1))).toEqual(['open', 'close']);
+  });
+
   it('does not confuse allocation with a successfully started browser', async () => {
     const h = harness();
     h.registry.ensure(ID);
