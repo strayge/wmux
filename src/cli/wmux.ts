@@ -504,17 +504,23 @@ const BROWSER_CMDS: Record<string, (args: string[]) => BrowserRequest> = {
  * verb. Pure, so the deadlines and the caller wiring are testable without a
  * running app.
  *
- * `caller` is the *terminal* surface the command is issued on behalf of, not a
- * browser surface: the main process maps it to that pane's own browser, which is
- * what keeps concurrent agents isolated (issue #62). Passing it explicitly does
- * not change that routing — it only supplies from a flag what a shell inside a
- * pane supplies from $WMUX_SURFACE_ID.
+ * `caller` is ambient context. An explicit --surface names a browser directly
+ * or a terminal's workspace-scoped browser; preserve that distinction so main
+ * refuses a closed target instead of falling back to another browser.
  */
 export function browserRequest(args: string[], caller?: string): BrowserRequest | null {
-  const build = BROWSER_CMDS[args[1]];
+  const explicit = args.includes('--surface');
+  const surfaceId = getFlag(args, '--surface');
+  if (explicit && (!surfaceId?.trim() || surfaceId.startsWith('--'))) {
+    throw new Error('--surface requires a value');
+  }
+  const rest = stripFlag(args, '--surface');
+  const build = BROWSER_CMDS[rest[1]];
   if (!build) return null;
-  const req = build(args);
-  return caller ? { ...req, params: { ...req.params, caller } } : req;
+  const req = build(rest);
+  const target = explicit ? surfaceId : caller;
+  return { ...req, params: { ...req.params, ...(target ? { caller: target } : {}),
+    ...(explicit && rest[1] !== 'engine' ? { surfaceId } : {}) } };
 }
 
 /** How long `wmux open` waits for the renderer to accept the URL. */
@@ -603,13 +609,13 @@ async function cmdRemote(args: string[]): Promise<void> {
 }
 
 async function cmdBrowser(args: string[]): Promise<void> {
-  // --surface says which pane's browser to drive, mirroring send / read-screen /
-  // agent-activity. Strip it before the verb reads its positional args, or
-  // `browser type e5 --surface surf-x hi` would type the flag into the page.
-  const caller = getFlag(args, '--surface') || process.env.WMUX_SURFACE_ID;
-  const rest = stripFlag(args, '--surface');
-  const req = browserRequest(rest, caller);
-  if (!req) failSubcommand('browser', rest[1]);
+  let req: BrowserRequest | null;
+  try {
+    req = browserRequest(args, process.env.WMUX_SURFACE_ID);
+  } catch (err: any) {
+    return fail('browser', COMMAND_SPECS.browser, err.message);
+  }
+  if (!req) failSubcommand('browser', stripFlag(args, '--surface')[1]);
   print(await sendV2(req.method, req.params, req.timeoutMs));
 }
 
@@ -2330,7 +2336,14 @@ export const COMMAND_SPECS = {
       'wmux browser screenshot [--full] | get-text [ref] | eval <js> | wait <ref> [ms]',
       'wmux browser back | forward | reload',
       'wmux browser engine [web|agent]   # print, or switch, this surface\'s engine',
-      `  [--surface <id>]   ${SURFACE_NOTE}`,
+      '  --surface <id> targets a live browser or a live terminal\'s workspace-scoped browser.',
+      'Page inspection requires a browser pane (not a side panel); open <url> may create one.',
+      'Without a valid caller or --surface, use the focused window\'s active workspace',
+      '(or the sole live window): reuse its sole browser; ambiguity requires --surface.',
+      'Inventory: wmux list-surfaces (type: browser). Unknown explicit targets error.',
+      'engine is read-only without a value; default web does not prove a browser exists.',
+      'engine web|agent may create a browser pane in the caller\'s workspace before navigation.',
+      'Both engine forms require a caller or --surface <id>.',
     ].join('\n'),
     passthrough: true,
   },

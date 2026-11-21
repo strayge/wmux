@@ -1,12 +1,13 @@
 /**
- * v2-browser.ts — Per-caller browser routing for V2 pipe handlers (issue #62).
+ * v2-browser.ts — Per-caller browser routing for V2 pipe handlers.
  *
  * Each distinct caller (an agent's terminal surface, identified by its
  * WMUX_SURFACE_ID and sent as `params.caller`) is bound to its OWN browser
- * surface, created in that caller's workspace. The CDPBridge tracks every
- * attached browser independently, so concurrent agents no longer share — and
- * clobber — a single browser window. With no caller (manual human use) we fall
- * back to the legacy shared browser.
+ * surface in that caller's workspace. Among page commands, only navigation
+ * can create a browser pane. The CDPBridge tracks every attached browser
+ * independently, so concurrent agents no longer share — and clobber — a single
+ * browser window. Without valid caller context, commands use the sole browser
+ * pane (not a side panel) in the selected window's active workspace.
  *
  * ── Two engines, one set of verbs ─────────────────────────────────────────
  * A browser surface is backed either by the Electron <webview> (`web`, the
@@ -28,6 +29,7 @@ import { acquireDashboardFor, ensureStartedSession, runAgentBrowserForSession, w
 import type { AgentSession } from './agent-browser-session';
 import { toAgentBrowserArgv } from './agent-browser-verbs';
 import { keepRenderingLeases } from './browser-keep-rendering';
+import { targetForCaller, type CallerTarget } from './v2-bridge';
 import type { BrowserEngine, SurfaceId } from '../shared/types';
 
 type Respond = (result: any) => void;
@@ -61,27 +63,44 @@ export interface BrowserDeps {
   keepRendering?: (wcId: number) => Promise<void>;
 }
 
-function firstWindow(): BrowserWindow | null {
-  const win = BrowserWindow.getAllWindows()[0];
-  return win && !win.isDestroyed() ? win : null;
-}
+/** Layout membership, not CDP attachment order, authorizes untargeted commands. */
+async function resolveUntargetedBrowserTarget(allowCreate: boolean): Promise<BrowserTarget | null> {
+  const live = BrowserWindow.getAllWindows().filter((win) => !win.isDestroyed());
+  if (!live.length) throw new Error('No live wmux window is available.');
+  const focused = BrowserWindow.getFocusedWindow();
+  const win = focused && live.includes(focused) ? focused : live.length === 1 ? live[0] : null;
+  if (!win) throw new Error('Multiple wmux windows are open and none is focused. Pass --surface <id> to choose a target.');
 
-/**
- * Auto-create a shared browser panel if none exists, then wait for CDP to
- * attach. Legacy single-browser path used when a command has no caller context.
- */
-async function ensureBrowserPanel(): Promise<boolean> {
-  if (cdpBridge.isAttached) return true;
-  const win = firstWindow();
-  if (!win) return false;
-  await win.webContents.executeJavaScript(
-    `window.__wmux_splitPane?.({ direction: 'horizontal', type: 'browser' })`,
-  );
-  const deadline = Date.now() + 5000;
-  while (!cdpBridge.isAttached && Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 100));
+  // Both globals run synchronously in one renderer turn: focus cannot change
+  // the active workspace between reading its id and counting its browser tabs.
+  const layout = await win.webContents.executeJavaScript(`(() => {
+    if (!window.__wmux_listWorkspaces || !window.__wmux_listBrowserSurfaces)
+      return { error: 'Browser workspace layout is unavailable in the selected wmux window.' };
+    const workspace = window.__wmux_listWorkspaces().find(ws => ws.isActive);
+    if (!workspace) return { error: 'No active workspace in the selected wmux window.' };
+    return { workspaceId: workspace.id, surfaceIds: window.__wmux_listBrowserSurfaces(workspace.id) };
+  })()`).catch(() => {
+    throw new Error('Browser workspace layout is unavailable in the selected wmux window.');
+  });
+  if (typeof layout?.error === 'string') throw new Error(layout.error);
+  if (typeof layout?.workspaceId !== 'string' || !layout.workspaceId || !Array.isArray(layout.surfaceIds)
+    || !layout.surfaceIds.every((id: unknown) => typeof id === 'string' && id)) {
+    throw new Error('Cannot read the active workspace browser layout in the selected wmux window.');
   }
-  return cdpBridge.isAttached;
+  if (layout.surfaceIds.length > 1) {
+    throw new Error('Multiple browser panes are available in the active workspace. Pass --surface <id> to choose a target.');
+  }
+  let surfaceId: string | undefined = layout.surfaceIds[0];
+  if (!surfaceId) {
+    if (!allowCreate) return null;
+    const created = await win.webContents.executeJavaScript(
+      `window.__wmux_splitPane?.({ direction: 'horizontal', type: 'browser', workspaceId: ${JSON.stringify(layout.workspaceId)} }) ?? null`,
+    );
+    surfaceId = created?.surfaceId;
+    if (!surfaceId) throw new Error('Could not create a browser surface in the selected workspace.');
+  }
+  if ((await engineForSurface(surfaceId)) === 'agent') return agentTargetFor(surfaceId);
+  return { kind: 'web', wcId: await pollSurfaceWcId(surfaceId, 5000) };
 }
 
 // caller terminal surface → its own browser surface. boundBrowserSurfaces tracks
@@ -90,48 +109,29 @@ async function ensureBrowserPanel(): Promise<boolean> {
 const callerBrowserSurface = new Map<string, string>();
 const boundBrowserSurfaces = new Set<string>();
 
-async function pollSurfaceWcId(surfaceId: string, timeoutMs: number): Promise<number | null> {
+async function pollSurfaceWcId(surfaceId: string, timeoutMs: number): Promise<number> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const wcId = cdpBridge.wcIdForSurface(surfaceId);
     if (wcId !== null) return wcId;
     await new Promise((r) => setTimeout(r, 100));
   }
-  return cdpBridge.wcIdForSurface(surfaceId);
-}
-
-async function legacyWcId(): Promise<number | null> {
-  return (await ensureBrowserPanel()) ? cdpBridge.attachedWebContentsId : null;
+  const wcId = cdpBridge.wcIdForSurface(surfaceId);
+  if (wcId !== null) return wcId;
+  throw new Error(`Browser surface ${surfaceId} is not ready: CDP did not attach within ${timeoutMs}ms. Retry once the page is ready.`);
 }
 
 /**
- * Resolve which browser webContents a command should run against, creating /
- * binding a per-caller browser surface as needed. Returns the wcId, or null if
- * no browser could be readied.
+ * Renderer membership validates cached bindings before CDP or Agent dispatch.
+ * Among page commands, only navigation may create a pane. Null also represents
+ * an Agent binding, whose session is resolved by the caller rather than polled
+ * for CDP.
  */
-async function resolveBrowserWcId(caller?: string): Promise<number | null> {
-  const win = firstWindow();
-  if (!win) return null;
-  if (!caller) return legacyWcId();
-
-  // Reuse this caller's already-bound browser if it's still live.
-  const bound = callerBrowserSurface.get(caller);
-  if (bound) {
-    const wcId = cdpBridge.wcIdForSurface(bound);
-    if (wcId !== null) return wcId;
-    callerBrowserSurface.delete(caller);
-    // A caller bound to ITSELF (see below) never claimed the surface, so it has
-    // no ownership to give back — the terminal that does own it keeps it.
-    if (bound !== caller) boundBrowserSurfaces.delete(bound);
-  }
-
-  const workspaceId: string | null = await win.webContents.executeJavaScript(
-    `window.__wmux_getWorkspaceIdForSurface?.(${JSON.stringify(caller)}) ?? null`,
-  );
-  if (!workspaceId) return legacyWcId();
+async function resolveBrowserWcId(caller: string, allowCreate: boolean, located: CallerTarget<BrowserWindow>): Promise<number | null> {
+  const { win, workspaceId } = located;
 
   // Adopt an existing unowned browser surface in the workspace (e.g. one the user
-  // opened manually); otherwise spawn a fresh browser pane in that workspace.
+  // opened manually); among page commands, only navigation may create one there.
   const existing: string[] = await win.webContents.executeJavaScript(
     `window.__wmux_listBrowserSurfaces?.(${JSON.stringify(workspaceId)}) ?? []`,
   );
@@ -143,7 +143,7 @@ async function resolveBrowserWcId(caller?: string): Promise<number | null> {
   // for it, and an agent that then targeted the pane it could see (the newest)
   // split another on every command. Same precedence `pickBrowserSurface` gives
   // `browser engine`, fixed there in 2.1.0 and never carried over to the verbs.
-  // Bound to itself so later commands take the fast path above, but NOT added
+  // Bound to itself for subsequent resolution, but NOT added
   // to `boundBrowserSurfaces`: naming a pane is not owning it, and a terminal
   // agent may still adopt it.
   if (existing.includes(caller)) {
@@ -152,14 +152,26 @@ async function resolveBrowserWcId(caller?: string): Promise<number | null> {
     return pollSurfaceWcId(caller, 5000);
   }
 
+  // Renderer membership, not an engine value or a lingering CDP registration,
+  // proves a cached surface is live. Keep live Agent bindings without CDP.
+  const bound = callerBrowserSurface.get(caller);
+  if (bound && existing.includes(bound)) {
+    if ((await engineForSurface(bound)) === 'agent') return null;
+    return pollSurfaceWcId(bound, 5000);
+  }
+  if (bound) {
+    callerBrowserSurface.delete(caller);
+    if (bound !== caller) boundBrowserSurfaces.delete(bound);
+  }
+
   let browserSurfaceId = existing.find((id) => !boundBrowserSurfaces.has(id)) ?? null;
-  if (!browserSurfaceId) {
+  if (!browserSurfaceId && allowCreate) {
     const created = await win.webContents.executeJavaScript(
       `window.__wmux_splitPane?.({ direction: 'horizontal', type: 'browser', workspaceId: ${JSON.stringify(workspaceId)} }) ?? null`,
     );
     browserSurfaceId = created?.surfaceId ?? null;
   }
-  if (!browserSurfaceId) return legacyWcId();
+  if (!browserSurfaceId) return null;
 
   callerBrowserSurface.set(caller, browserSurfaceId);
   boundBrowserSurfaces.add(browserSurfaceId);
@@ -179,11 +191,8 @@ async function resolveBrowserWcId(caller?: string): Promise<number | null> {
  * Asked of the RENDERER, because the split tree lives in the Zustand store and
  * main has no copy of it. Three details are load-bearing:
  *
- *  - EVERY window is asked, first affirmative answer wins. `firstWindow()` is
- *    `getAllWindows()[0]`, and the surface may live in window 2 — the #143
- *    "window ≠ workspace" mistake. `resolveBrowserWcId` has the same shape, but
- *    its wrong answer is a benign fall-back to the shared browser, whereas a
- *    wrong answer HERE dispatches to the wrong engine silently.
+ *  - EVERY window is asked, first affirmative answer wins. A surface may live
+ *    in a different window; using only the first silently picks the wrong engine.
  *  - `?.` and `?? 'web'` let this ship before the renderer half exists: a
  *    renderer that has never heard of `__wmux_getBrowserEngine` degrades to
  *    exactly today's behaviour instead of throwing on every browser command.
@@ -233,29 +242,14 @@ async function agentTargetFor(surfaceId: string): Promise<BrowserTarget> {
 }
 
 /**
- * Resolve where a command should run: which browser, on which engine.
- *
- * The engine is checked for whichever surface ends up bound, on EVERY outcome
- * — not only when there was no wcId. That is the correctness core of this
- * function, and the obvious shortcut is wrong:
- *
- * A surface TOGGLED from web to agent keeps its CDP registration. Nothing calls
- * `cdp.detach` on a toggle, and `pruneDead()` only drops destroyed webContents,
- * so `wcIdForSurface` keeps returning a perfectly valid, NON-null id for it.
- * Checking the engine only on the null branch therefore misses the toggled case
- * entirely: `resolveBrowserWcId` adopts the surface, polls, gets that stale id,
- * and the command drives CDP against agent-browser's own dashboard SPA —
- * corrupting the pane the user is watching, silently.
- *
- * The pre-check on an already-bound caller is a separate matter, and also not
- * cosmetic: it keeps `resolveBrowserWcId` from reading an agent surface's
- * missing wcId as "my browser died" and dropping a live #62 binding.
+ * Readiness includes renderer resolution and Agent startup, not the optional
+ * dashboard. Even a non-null CDP registration must respect an engine toggle.
  */
-export async function resolveBrowserTarget(caller?: string): Promise<BrowserTarget | null> {
+export async function resolveBrowserTarget(caller?: string, allowCreate = false, surfaceId?: string): Promise<BrowserTarget | null> {
   // The public CLI budgets already reserve 5s for readiness. Shared UI startup
   // may continue after this request gives up, but its requested verb must not.
   const outcome = await withDeadline<{ target: BrowserTarget | null } | { error: unknown }>(
-    resolveBrowserTargetWithinBudget(caller).then((target) => ({ target }), (error: unknown) => ({ error })),
+    resolveBrowserTargetWithinBudget(surfaceId ?? caller, allowCreate, surfaceId !== undefined).then((target) => ({ target }), (error: unknown) => ({ error })),
     5000,
     { error: new Error('Browser readiness timed out after 5s. The session may still be starting; retry the command once the page is ready.') },
   );
@@ -263,18 +257,24 @@ export async function resolveBrowserTarget(caller?: string): Promise<BrowserTarg
   return outcome.target;
 }
 
-async function resolveBrowserTargetWithinBudget(caller?: string): Promise<BrowserTarget | null> {
-  const bound = caller ? callerBrowserSurface.get(caller) : undefined;
-  if (bound && (await engineForSurface(bound)) === 'agent') return agentTargetFor(bound);
+async function resolveBrowserTargetWithinBudget(caller: string | undefined, allowCreate: boolean, explicit: boolean): Promise<BrowserTarget | null> {
+  if (!caller) return resolveUntargetedBrowserTarget(allowCreate);
+  // A closed terminal's surviving binding no longer authorizes targeting it.
+  const located = await targetForCaller(caller);
+  // The bridge's fallback window has no workspace id: it is not ownership.
+  if (!located?.workspaceId) {
+    const bound = callerBrowserSurface.get(caller);
+    callerBrowserSurface.delete(caller);
+    if (bound && bound !== caller) boundBrowserSurfaces.delete(bound);
+    if (explicit) throw new Error(`Unknown or closed surface: ${caller}. Run wmux list-surfaces to check.`);
+    return resolveUntargetedBrowserTarget(allowCreate);
+  }
+  const wcId = await resolveBrowserWcId(caller, allowCreate, located);
 
-  const wcId = await resolveBrowserWcId(caller);
-
-  // Whatever `resolveBrowserWcId` settled on — a surface it just adopted, one
-  // it created, or a rebind after the old one died — is the surface this
-  // command will actually run against, so it is the one whose engine decides.
-  // `bound` was already checked above and is skipped rather than re-asked.
-  const settled = caller ? callerBrowserSurface.get(caller) : undefined;
-  if (settled && settled !== bound && (await engineForSurface(settled)) === 'agent') {
+  // Only bindings verified against the renderer by resolution may start a
+  // session. A stale engine value must never resurrect a closed browser.
+  const settled = callerBrowserSurface.get(caller);
+  if (settled && (await engineForSurface(settled)) === 'agent') {
     return agentTargetFor(settled);
   }
 
@@ -433,6 +433,7 @@ export async function runBrowserCommandForTarget(
   target: BrowserTarget,
   deps: BrowserDeps,
 ): Promise<any> {
+  validateBrowserCommand(method, params);
   if (target.kind === 'agent') {
     // Built FIRST, before anything is spawned: an unsupported verb must cost a
     // rejected message, not a Chrome round-trip. `toAgentBrowserArgv` throws
@@ -483,8 +484,10 @@ export async function runBrowserCommandForTarget(
     case 'browser.reload':
       await bridge.reload(wcId);
       return { ok: true };
-    default:
-      throw Object.assign(new Error(`Unknown: ${method}`), { rpcCode: -32601 });
+    default: {
+      const unhandled: never = method;
+      throw Object.assign(new Error(`Unknown: ${unhandled}`), { rpcCode: -32601 });
+    }
   }
 }
 
@@ -509,9 +512,43 @@ const defaultDeps: BrowserDeps = {
   keepRendering: async (wcId) => keepRenderingLeases.touch(wcId, cdpBridge.surfaceIdFor(wcId)),
 };
 
+const NO_BROWSER = 'No browser pane is available. Run wmux list-surfaces to check, or wmux browser open <url> to open one.';
+
+const BROWSER_METHODS = [
+  'browser.navigate', 'browser.snapshot', 'browser.click', 'browser.type', 'browser.fill',
+  'browser.screenshot', 'browser.get_text', 'browser.eval', 'browser.wait', 'browser.back',
+  'browser.forward', 'browser.reload',
+] as const;
+type BrowserMethod = typeof BROWSER_METHODS[number];
+
+/** Reject invalid navigation before layout mutation; keep the web switch exhaustive. */
+function validateBrowserCommand(method: string, params: any): asserts method is BrowserMethod {
+  if (!(BROWSER_METHODS as readonly string[]).includes(method)) {
+    throw Object.assign(new Error(`Unknown: ${method}`), { rpcCode: -32601 });
+  }
+  if (method === 'browser.navigate' && (typeof params?.url !== 'string' || !params.url.trim())) {
+    throw Object.assign(new Error('browser.navigate requires a nonempty url'), { rpcCode: -32602 });
+  }
+}
+
 async function handleBrowserBatch(params: any, respond: Respond, respondError: RespondError): Promise<void> {
-  const target = await resolveBrowserTarget(params?.caller);
-  if (target === null) { respondError(-32000, 'Could not open browser panel'); return; }
+  if (!Array.isArray(params?.commands)) {
+    respondError(-32602, 'browser.batch commands must be an array');
+    return;
+  }
+  if (params.commands.length === 0) {
+    respond({ results: [] });
+    return;
+  }
+  const first = params.commands[0];
+  try {
+    if (first) validateBrowserCommand(first.method, first.params);
+  } catch (err: any) {
+    respond({ results: [{ error: { code: err.rpcCode ?? -32000, message: err.message } }] });
+    return;
+  }
+  const target = await resolveBrowserTarget(params?.caller, first?.method === 'browser.navigate', params?.surfaceId);
+  if (target === null) { respondError(-32000, NO_BROWSER); return; }
   const results: any[] = [];
   for (const cmd of params?.commands || []) {
     try {
@@ -532,12 +569,17 @@ export function handleBrowserV2(
   respondError: RespondError,
 ): void {
   (async () => {
+    if (params?.surfaceId !== undefined && (typeof params.surfaceId !== 'string' || !params.surfaceId.trim())) {
+      respondError(-32602, 'surfaceId must be a nonempty string');
+      return;
+    }
     if (method === 'browser.batch') {
       await handleBrowserBatch(params, respond, respondError);
       return;
     }
-    const target = await resolveBrowserTarget(params?.caller);
-    if (target === null) { respondError(-32000, 'Could not open browser panel'); return; }
+    validateBrowserCommand(method, params);
+    const target = await resolveBrowserTarget(params?.caller, method === 'browser.navigate', params?.surfaceId);
+    if (target === null) { respondError(-32000, NO_BROWSER); return; }
     respond(await runBrowserCommandForTarget(method, params, target, defaultDeps));
     // `err.rpcCode ?? -32000`, matching the batch loop. It used to be a flat
     // -32000 here, so an unknown verb reported -32601 inside a batch and -32000

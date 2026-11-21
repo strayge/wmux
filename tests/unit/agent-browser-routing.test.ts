@@ -14,6 +14,7 @@ import type { SurfaceRef } from '../../src/shared/types';
  */
 const env = vi.hoisted(() => ({
   windows: [] as any[],
+  focusedWindow: undefined as any,
   wcIdBySurface: new Map<string, number>(),
   acquired: [] as string[],
   /** Swappable so a test can make the dashboard hang or fail. */
@@ -24,13 +25,21 @@ const env = vi.hoisted(() => ({
 }));
 
 vi.mock('electron', () => ({
-  BrowserWindow: { getAllWindows: () => env.windows, getFocusedWindow: () => env.windows[0] ?? null },
+  BrowserWindow: {
+    getAllWindows: () => env.windows,
+    getFocusedWindow: () => env.focusedWindow === undefined ? env.windows[0] ?? null : env.focusedWindow,
+  },
 }));
 vi.mock('../../src/main/ipc-handlers', () => ({
   cdpBridge: {
     wcIdForSurface: (id: string) => env.wcIdBySurface.get(id) ?? null,
     get isAttached() { return env.wcIdBySurface.size > 0; },
-    get attachedWebContentsId() { return [...env.wcIdBySurface.values()][0] ?? null; },
+    get attachedWebContentsId() { return [...env.wcIdBySurface.values()].at(-1) ?? null; },
+    surfaceIdFor: (wcId: number) => [...env.wcIdBySurface].find(([, id]) => id === wcId)?.[0] ?? null,
+    navigate: vi.fn(async () => {}),
+    snapshot: vi.fn(async () => ({ tree: '- button "OK" [ref=e1]', refCount: 1 })),
+    screenshot: vi.fn(async () => 'BASE64'),
+    evaluate: vi.fn(async () => 42),
   },
 }));
 vi.mock('../../src/main/agent-browser-cli', async (importOriginal) => ({
@@ -59,6 +68,7 @@ vi.mock('../../src/main/agent-browser-runtime', async (importOriginal) => ({
   }),
 }));
 
+import { cdpBridge } from '../../src/main/ipc-handlers';
 import {
   handleBrowserV2,
   resolveBrowserTarget,
@@ -489,7 +499,7 @@ describe('the two engines are indistinguishable to a caller', () => {
 // ── target resolution ──────────────────────────────────────────────────────
 
 /**
- * A renderer window that answers the four `window.__wmux_*` globals
+ * A renderer window that answers the `window.__wmux_*` globals
  * `resolveBrowserTarget` reaches for. Dispatch is on the global's name and the
  * first quoted argument, because that string of JS is genuinely how main talks
  * to the store.
@@ -500,17 +510,33 @@ function fakeWindow(opts: {
   engines?: Record<string, string>;
   created?: string;
   destroyed?: boolean;
+  activeWorkspaceId?: string | null;
+  layoutAvailable?: boolean;
 }) {
   const calls: string[] = [];
+  const workspaceIds = [...new Set([...Object.values(opts.workspaceOf ?? {}), ...Object.keys(opts.browsersIn ?? {})])];
+  if (!workspaceIds.length) workspaceIds.push('ws-empty');
+  const activeWorkspaceId = opts.activeWorkspaceId === undefined ? workspaceIds[0] : opts.activeWorkspaceId;
+  const workspaceOf = (id: string) => opts.workspaceOf?.[id]
+    ?? Object.entries(opts.browsersIn ?? {}).find(([, ids]) => ids.includes(id))?.[0];
   return {
+    id: ++windowSeq,
     calls,
     isDestroyed: () => opts.destroyed ?? false,
     webContents: {
       executeJavaScript: async (js: string) => {
         calls.push(js);
+        if (js.includes('__wmux_listWorkspaces')) {
+          const bridge = opts.layoutAvailable === false ? {} : {
+            __wmux_listWorkspaces: () => workspaceIds.map((id) => ({ id, isActive: id === activeWorkspaceId })),
+            __wmux_listBrowserSurfaces: (id: string) => opts.browsersIn?.[id] ?? [],
+          };
+          return new Function('window', `return ${js}`)(bridge);
+        }
         const arg = /"([^"]+)"/.exec(js)?.[1] ?? '';
         if (js.includes('__wmux_getBrowserEngine')) return opts.engines?.[arg] ?? 'web';
-        if (js.includes('__wmux_getWorkspaceIdForSurface')) return opts.workspaceOf?.[arg] ?? null;
+        if (js.includes('__wmux_locateSurface')) return workspaceOf(arg) ? { workspaceId: workspaceOf(arg) } : null;
+        if (js.includes('__wmux_getWorkspaceIdForSurface')) return workspaceOf(arg) ?? null;
         if (js.includes('__wmux_listBrowserSurfaces')) return opts.browsersIn?.[arg] ?? [];
         if (js.includes('__wmux_splitPane')) return opts.created ? { surfaceId: opts.created } : null;
         return null;
@@ -521,11 +547,14 @@ function fakeWindow(opts: {
 
 // Module state (the #62 caller→browser binding) lives for the whole file, so
 // every test uses its own caller id rather than trying to reset it.
+let windowSeq = 0;
 let callerSeq = 0;
 const nextCaller = () => `surf-caller-${++callerSeq}`;
 
 function resetEnv(): void {
+  vi.clearAllMocks();
   env.windows = [];
+  env.focusedWindow = undefined;
   env.wcIdBySurface = new Map();
   env.acquired = [];
   env.acquireImpl = async () => {};
@@ -606,13 +635,7 @@ describe('resolveBrowserTarget — which engine a command lands on', () => {
     expect(target?.kind).toBe('agent');
   });
 
-  /**
-   * `firstWindow()` is `getAllWindows()[0]`, but a surface may live in window 2
-   * — the #143 "window ≠ workspace" mistake. `resolveBrowserWcId` has the same
-   * shape and its wrong answer is a benign fall-back to the shared browser;
-   * a wrong answer about the ENGINE silently dispatches to the wrong one, so
-   * this query has to poll every window and take the first affirmative.
-   */
+  /** A surface's engine must be resolved in its owning window, not the first. */
   it('asks every window, not just the first, which engine a surface is on (#143)', async () => {
     const caller = nextCaller();
     const engines: Record<string, string> = { 'surf-elsewhere': 'web' };
@@ -723,6 +746,444 @@ describe('resolveBrowserTarget — which engine a command lands on', () => {
   });
 });
 
+describe('browser surface creation guardrail', () => {
+  beforeEach(resetEnv);
+
+  const request = (method: string, params: any = {}) =>
+    new Promise<{ code?: number; message?: string; result?: any }>((resolve) => {
+      handleBrowserV2(method, params, (result) => resolve({ result }), (code, message) => resolve({ code, message }));
+    });
+  const splitCalls = () => env.windows.flatMap((win) => win.calls.filter((js: string) => js.includes('__wmux_splitPane')));
+  const expectNoDispatch = () => {
+    expect(cdpBridge.navigate).not.toHaveBeenCalled();
+    expect(cdpBridge.snapshot).not.toHaveBeenCalled();
+    expect(cdpBridge.screenshot).not.toHaveBeenCalled();
+    expect(cdpBridge.evaluate).not.toHaveBeenCalled();
+    expect(env.nativeCalls).toEqual([]);
+    expect(env.acquired).toEqual([]);
+  };
+
+  it.each(['caller', 'untargeted', 'stale ambient'])('page commands cannot split through the %s path', async (route) => {
+    const caller = nextCaller();
+    env.windows = [fakeWindow({ workspaceOf: route === 'caller' ? { [caller]: 'ws-empty' } : {}, created: 'surf-forbidden' })];
+    const params = route === 'untargeted' ? {} : { caller };
+    for (const method of ['browser.snapshot', 'browser.screenshot', 'browser.eval']) {
+      const answer = await request(method, params);
+      expect(answer.code).toBe(-32000);
+      expect(answer.message).toContain('wmux list-surfaces');
+      expect(answer.message).toContain('wmux browser open <url>');
+    }
+    expect(splitCalls()).toEqual([]);
+    expectNoDispatch();
+  });
+
+  it.each(['caller', 'untargeted'])('open can create through the %s path and snapshot reuses it', async (route) => {
+    const caller = nextCaller();
+    const surfaceId = `surf-created-${caller}`;
+    const browsersIn = { 'ws-new': [] as string[] };
+    const win = fakeWindow({ workspaceOf: { [caller]: 'ws-new' }, browsersIn, created: surfaceId });
+    const execute = win.webContents.executeJavaScript;
+    win.webContents.executeJavaScript = async (js) => {
+      if (js.includes('__wmux_splitPane')) {
+        browsersIn['ws-new'].push(surfaceId);
+        env.wcIdBySurface.set(surfaceId, 71);
+      }
+      return execute(js);
+    };
+    env.windows = [win];
+    const params = route === 'caller' ? { caller } : {};
+    expect(await request('browser.navigate', { ...params, url: 'https://fixture.test/' })).toEqual({ result: { ok: true } });
+    expect(await request('browser.snapshot', params)).toEqual({ result: SNAPSHOT });
+    expect(splitCalls()).toHaveLength(1);
+    expect(cdpBridge.navigate).toHaveBeenCalledWith('https://fixture.test/', undefined, 71);
+    expect(cdpBridge.snapshot).toHaveBeenCalledWith(71);
+  });
+
+  it.each(['caller', 'untargeted'])('rejects blank navigation before splitting through the %s path', async (route) => {
+    const caller = nextCaller();
+    env.windows = [fakeWindow({ workspaceOf: { [caller]: 'ws-empty' }, created: 'surf-forbidden' })];
+    const params = route === 'caller' ? { caller } : {};
+    for (const url of [undefined, '', '  ', 42]) {
+      expect((await request('browser.navigate', { ...params, url })).code).toBe(-32602);
+    }
+    expect(splitCalls()).toEqual([]);
+    expectNoDispatch();
+  });
+
+  it.each(['web', 'agent'])('discards a closed %s binding despite lingering CDP and engine state', async (engine) => {
+    const caller = nextCaller();
+    const surfaceId = `surf-stale-${caller}`;
+    const browsersIn = { 'ws-stale': [surfaceId] };
+    env.windows = [fakeWindow({ workspaceOf: { [caller]: 'ws-stale' }, browsersIn, engines: { [surfaceId]: engine }, created: 'surf-forbidden' })];
+    env.wcIdBySurface.set(surfaceId, 72);
+    await resolveBrowserTarget(caller);
+    browsersIn['ws-stale'] = [];
+    env.acquired = [];
+    const start = vi.fn(async () => SESSION);
+    env.startImpl = start;
+    const answer = await request('browser.snapshot', { caller });
+    expect(answer.code).toBe(-32000);
+    expect(splitCalls()).toEqual([]);
+    expect(start).not.toHaveBeenCalled();
+    expectNoDispatch();
+  });
+
+  it('does not reuse a closed shared surface just because CDP remains attached', async () => {
+    env.windows = [fakeWindow({ created: 'surf-forbidden' })];
+    env.wcIdBySurface.set('surf-closed-shared', 73);
+    expect((await request('browser.snapshot')).code).toBe(-32000);
+    expect(splitCalls()).toEqual([]);
+    expectNoDispatch();
+  });
+
+  it('reuses the sole active-workspace Web browser despite newer side-panel and other-workspace attachments', async () => {
+    const win = fakeWindow({ activeWorkspaceId: 'ws-selected',
+      browsersIn: { 'ws-other': ['surf-other-web'], 'ws-selected': ['surf-selected-web'] }, created: 'surf-forbidden' });
+    env.windows = [win];
+    env.wcIdBySurface.set('surf-selected-web', 81);
+    env.wcIdBySurface.set('surf-other-web', 82);
+    env.wcIdBySurface.set('browser-ws-selected', 83);
+    expect(await request('browser.snapshot')).toEqual({ result: SNAPSHOT });
+    expect(await request('browser.navigate', { url: 'https://fixture.test/' })).toEqual({ result: { ok: true } });
+    expect(cdpBridge.snapshot).toHaveBeenCalledWith(81);
+    expect(cdpBridge.navigate).toHaveBeenCalledWith('https://fixture.test/', undefined, 81);
+    expect(win.calls.filter((js) => js.includes('__wmux_listWorkspaces'))).toHaveLength(2);
+    expect(win.calls.filter((js) => js.includes('__wmux_listBrowserSurfaces')))
+      .toEqual(win.calls.filter((js) => js.includes('__wmux_listWorkspaces')));
+    expect(splitCalls()).toEqual([]);
+    expect(env.acquired).toEqual([]);
+    expect(env.nativeCalls).toEqual([]);
+  });
+
+  it.each([false, true])('reuses the sole Agent browser without driving its dashboard (CDP attached: %s)', async (attached) => {
+    const surfaceId = `surf-untargeted-agent-${attached}`;
+    env.windows = [fakeWindow({ browsersIn: { 'ws-agent': [surfaceId] }, engines: { [surfaceId]: 'agent' }, created: 'surf-forbidden' })];
+    if (attached) env.wcIdBySurface.set(surfaceId, 85);
+    env.nativeImpl = async () => ok(null, SNAPSHOT.tree);
+    expect(await request('browser.snapshot')).toEqual({ result: SNAPSHOT });
+    expect(await request('browser.navigate', { url: 'https://fixture.test/' })).toEqual({ result: { ok: true } });
+    expect(env.nativeCalls.map(({ argv }) => argv)).toEqual([
+      ['--session', `wmux-${surfaceId}`, 'snapshot'],
+      ['--session', `wmux-${surfaceId}`, 'open', 'https://fixture.test/'],
+    ]);
+    expect(cdpBridge.snapshot).not.toHaveBeenCalled();
+    expect(cdpBridge.navigate).not.toHaveBeenCalled();
+    expect(splitCalls()).toEqual([]);
+  });
+
+  it.each(['browser.snapshot', 'browser.navigate', 'browser.batch'])('requires --surface for mixed-engine ambiguity on %s without starting, splitting or claiming', async (method) => {
+    const caller = nextCaller();
+    const webId = `surf-ambiguous-web-${caller}`, agentId = `surf-ambiguous-agent-${caller}`;
+    env.windows = [fakeWindow({ workspaceOf: { [caller]: 'ws-many' }, browsersIn: { 'ws-many': [webId, agentId] },
+      engines: { [agentId]: 'agent' }, created: 'surf-forbidden' })];
+    env.wcIdBySurface.set(webId, 87);
+    const start = vi.fn(async () => SESSION);
+    env.startImpl = start;
+    const answer = await request(method, { url: 'https://fixture.test/',
+      commands: [{ method: 'browser.navigate', params: { url: 'https://fixture.test/' } }] });
+    expect(answer.code).toBe(-32000);
+    expect(answer.message).toContain('--surface <id>');
+    expect(splitCalls()).toEqual([]);
+    expect(start).not.toHaveBeenCalled();
+    expectNoDispatch();
+    // Refusal must leave the first browser free for a terminal to adopt.
+    expect(await resolveBrowserTarget(caller)).toEqual({ kind: 'web', wcId: 87 });
+    expect(splitCalls()).toEqual([]);
+  });
+
+  it.each(['focused', 'sole unfocused', 'destroyed focus'])('selects the %s live window, never an arbitrary first window', async (focus) => {
+    const selected = fakeWindow({ browsersIn: { 'ws-selected': ['surf-focus-selected'] } });
+    const other = fakeWindow({ browsersIn: { 'ws-other': ['surf-focus-other'] }, destroyed: focus === 'destroyed focus' });
+    env.windows = focus === 'sole unfocused' ? [selected] : [other, selected];
+    env.focusedWindow = focus === 'focused' ? selected : focus === 'destroyed focus' ? other : null;
+    env.wcIdBySurface.set('surf-focus-selected', 91);
+    env.wcIdBySurface.set('surf-focus-other', 92);
+    expect(await request('browser.snapshot')).toEqual({ result: SNAPSHOT });
+    expect(cdpBridge.snapshot).toHaveBeenCalledWith(91);
+    expect(other.calls.filter((js) => js.includes('__wmux_listWorkspaces') || js.includes('__wmux_splitPane'))).toEqual([]);
+    expect(splitCalls()).toEqual([]);
+  });
+
+  it.each(['browser.snapshot', 'browser.navigate', 'browser.batch'])('refuses unfocused multi-window %s before querying any renderer', async (method) => {
+    env.windows = [fakeWindow({ created: 'surf-forbidden' }), fakeWindow({ created: 'surf-forbidden' })];
+    env.focusedWindow = null;
+    const answer = await request(method, { url: 'https://fixture.test/',
+      commands: [{ method: 'browser.navigate', params: { url: 'https://fixture.test/' } }] });
+    expect(answer.code).toBe(-32000);
+    expect(answer.message).toContain('--surface <id>');
+    expect(env.windows.flatMap((win) => win.calls)).toEqual([]);
+    expectNoDispatch();
+  });
+
+  it.each([
+    ['missing bridge', 'Browser workspace layout is unavailable in the selected wmux window.'],
+    ['missing workspace', 'No active workspace in the selected wmux window.'],
+    ['reloading renderer', 'Browser workspace layout is unavailable in the selected wmux window.'],
+    ['unreadable inventory', 'Cannot read the active workspace browser layout in the selected wmux window.'],
+  ])('fails closed for %s rather than treating it as empty', async (failure, message) => {
+    const win = fakeWindow({ created: 'surf-forbidden', layoutAvailable: failure !== 'missing bridge',
+      activeWorkspaceId: failure === 'missing workspace' ? null : undefined });
+    const execute = win.webContents.executeJavaScript;
+    const rejectLayout = vi.fn().mockRejectedValue(new Error('Script failed to execute'));
+    const rendererResults: unknown[] = [];
+    win.webContents.executeJavaScript = async (js) => {
+      if (js.includes('__wmux_listWorkspaces')) {
+        if (failure === 'reloading renderer') return rejectLayout();
+        if (failure === 'unreadable inventory') return { workspaceId: 'ws-empty' };
+        const result = await execute(js);
+        rendererResults.push(result);
+        return result;
+      }
+      return execute(js);
+    };
+    env.windows = [win];
+    for (const method of ['browser.snapshot', 'browser.navigate']) {
+      expect(await request(method, { url: 'https://fixture.test/' })).toEqual({ code: -32000, message });
+    }
+    expect(rendererResults).toEqual(failure === 'missing bridge' || failure === 'missing workspace'
+      ? [{ error: message }, { error: message }] : []);
+    expect(rejectLayout).toHaveBeenCalledTimes(failure === 'reloading renderer' ? 2 : 0);
+    expect(splitCalls()).toEqual([]);
+    expectNoDispatch();
+  });
+
+  it('does not count another workspace or a side panel as a browser in an empty active workspace', async () => {
+    env.windows = [fakeWindow({ activeWorkspaceId: 'ws-empty',
+      browsersIn: { 'ws-other': ['surf-only-elsewhere'], 'ws-empty': [] }, created: 'surf-forbidden' })];
+    env.wcIdBySurface.set('surf-only-elsewhere', 93);
+    env.wcIdBySurface.set('browser-ws-empty', 94);
+    const answer = await request('browser.snapshot');
+    expect(answer.code).toBe(-32000);
+    expect(answer.message).toContain('No browser pane');
+    expect(splitCalls()).toEqual([]);
+    expectNoDispatch();
+  });
+
+  it('pins navigation creation to the chosen window and workspace even if focus changes after the layout read', async () => {
+    const selected = fakeWindow({ browsersIn: { 'ws-pinned': [] }, created: 'surf-pinned' });
+    const other = fakeWindow({ browsersIn: { 'ws-other': [] }, created: 'surf-forbidden' });
+    const execute = selected.webContents.executeJavaScript;
+    selected.webContents.executeJavaScript = async (js) => {
+      const result = await execute(js);
+      if (js.includes('__wmux_listWorkspaces')) env.focusedWindow = other;
+      return result;
+    };
+    env.windows = [other, selected];
+    env.focusedWindow = selected;
+    env.wcIdBySurface.set('surf-pinned', 95);
+    expect(await request('browser.navigate', { url: 'https://fixture.test/' })).toEqual({ result: { ok: true } });
+    expect(splitCalls()).toEqual([expect.stringContaining('workspaceId: "ws-pinned"')]);
+    expect(other.calls.some((js) => js.includes('__wmux_splitPane'))).toBe(false);
+    expect(cdpBridge.navigate).toHaveBeenCalledWith('https://fixture.test/', undefined, 95);
+  });
+
+  it('reports a failed pinned split without trying another window or workspace', async () => {
+    env.windows = [fakeWindow({ browsersIn: { 'ws-removed': [] } }),
+      fakeWindow({ browsersIn: { 'ws-other': ['surf-fallback-forbidden'] }, created: 'surf-forbidden' })];
+    env.wcIdBySurface.set('surf-fallback-forbidden', 96);
+    const answer = await request('browser.navigate', { url: 'https://fixture.test/' });
+    expect(answer.code).toBe(-32000);
+    expect(answer.message).toContain('Could not create');
+    expect(splitCalls()).toEqual([expect.stringContaining('workspaceId: "ws-removed"')]);
+    expectNoDispatch();
+  });
+
+  it.each([false, true])('untargeted reuse does not change terminal ownership (already bound: %s)', async (bound) => {
+    const owner = nextCaller(), newcomer = nextCaller();
+    const surfaceId = `surf-ownership-${owner}`;
+    env.windows = [fakeWindow({ workspaceOf: { [owner]: 'ws-owner', [newcomer]: 'ws-owner' },
+      browsersIn: { 'ws-owner': [surfaceId] }, created: 'surf-forbidden' })];
+    env.wcIdBySurface.set(surfaceId, 97);
+    if (bound) await resolveBrowserTarget(owner);
+    expect(await request('browser.snapshot')).toEqual({ result: SNAPSHOT });
+    if (bound) {
+      expect(await resolveBrowserTarget(newcomer)).toBeNull();
+      expect(await resolveBrowserTarget(owner)).toEqual({ kind: 'web', wcId: 97 });
+    } else {
+      expect(await resolveBrowserTarget(newcomer)).toEqual({ kind: 'web', wcId: 97 });
+    }
+    expect(splitCalls()).toEqual([]);
+  });
+
+  it.each(['web', 'agent'])('a closed ambient caller drops its old %s binding and uses the active workspace', async (engine) => {
+    const caller = nextCaller();
+    const oldId = `surf-ambient-old-${caller}`;
+    const workspaceOf = { [caller]: 'ws-old' };
+    env.windows = [fakeWindow({ workspaceOf, activeWorkspaceId: 'ws-active',
+      browsersIn: { 'ws-old': [oldId], 'ws-active': ['surf-ambient-current'] }, engines: { [oldId]: engine } })];
+    env.wcIdBySurface.set(oldId, 98);
+    env.wcIdBySurface.set('surf-ambient-current', 99);
+    await resolveBrowserTarget(caller);
+    delete workspaceOf[caller];
+    env.acquired = [];
+    expect(await request('browser.snapshot', { caller })).toEqual({ result: SNAPSHOT });
+    expect(cdpBridge.snapshot).toHaveBeenCalledWith(99);
+    expect(env.acquired).toEqual([]);
+    expect(splitCalls()).toEqual([]);
+  });
+
+  it.each(['browser.snapshot', 'browser.navigate'])('never substitutes Web when untargeted Agent readiness fails for %s', async (method) => {
+    env.windows = [fakeWindow({ browsersIn: { 'ws-agent': ['surf-failing-agent'] },
+      engines: { 'surf-failing-agent': 'agent' }, created: 'surf-forbidden' })];
+    env.wcIdBySurface.set('surf-failing-agent', 100);
+    env.startImpl = async () => { throw new Error('Agent startup failed'); };
+    const answer = await request(method, { url: 'https://fixture.test/' });
+    expect(answer).toEqual({ code: -32000, message: 'Agent startup failed' });
+    expect(splitCalls()).toEqual([]);
+    expect(cdpBridge.navigate).not.toHaveBeenCalled();
+    expect(cdpBridge.snapshot).not.toHaveBeenCalled();
+    expect(env.nativeCalls).toEqual([]);
+  });
+
+  it('resolves an untargeted navigation batch once and keeps the chosen Agent session', async () => {
+    const win = fakeWindow({ browsersIn: { 'ws-batch-agent': ['surf-batch-agent'] }, engines: { 'surf-batch-agent': 'agent' } });
+    env.windows = [win];
+    env.nativeImpl = async () => ok(null, SNAPSHOT.tree);
+    expect(await request('browser.batch', { commands: [
+      { method: 'browser.navigate', params: { url: 'https://fixture.test/' } }, { method: 'browser.snapshot' },
+    ] })).toEqual({ result: { results: [{ result: { ok: true } }, { result: SNAPSHOT }] } });
+    expect(win.calls.filter((js) => js.includes('__wmux_listWorkspaces'))).toHaveLength(1);
+    expect(env.acquired).toEqual(['surf-batch-agent']);
+    expect(splitCalls()).toEqual([]);
+  });
+
+  it('refuses a closed explicit browser instead of falling back to the active browser', async () => {
+    const surfaceId = 'surf-closed-explicit-browser';
+    const browsersIn = { 'ws-explicit': [surfaceId] };
+    env.windows = [fakeWindow({ browsersIn })];
+    env.wcIdBySurface.set(surfaceId, 101);
+    await resolveBrowserTarget(undefined, false, surfaceId);
+    browsersIn['ws-explicit'] = ['surf-explicit-fallback-forbidden'];
+    env.wcIdBySurface.set('surf-explicit-fallback-forbidden', 102);
+    const answer = await request('browser.navigate', { surfaceId, url: 'https://fixture.test/' });
+    expect(answer.code).toBe(-32000);
+    expect(answer.message).toContain('Unknown or closed surface');
+    expect(splitCalls()).toEqual([]);
+    expectNoDispatch();
+  });
+
+  it.each([undefined, null, {}, 'invalid', { 0: { method: 'browser.navigate', params: { url: 'https://fixture.test/' } } }])(
+    'rejects non-array batch commands before resolving or splitting: %j', async (commands) => {
+      const win = fakeWindow({ created: 'surf-forbidden' });
+      env.windows = [win];
+      expect(await request('browser.batch', { commands })).toEqual({ code: -32602, message: 'browser.batch commands must be an array' });
+      expect(win.calls).toEqual([]);
+      expectNoDispatch();
+    },
+  );
+
+  it.each(['named', 'adopted', 'bound', 'created', 'untargeted', 'untargeted-created'])('reports unavailable CDP as readiness, not missing inventory, for a %s Web surface', async (route) => {
+    vi.useFakeTimers();
+    try {
+      const caller = nextCaller();
+      const surfaceId = `surf-not-ready-${caller}`;
+      const creates = route === 'created' || route === 'untargeted-created';
+      env.windows = [fakeWindow({ workspaceOf: { [caller]: 'ws-not-ready' },
+        browsersIn: { 'ws-not-ready': creates ? [] : [surfaceId] }, created: surfaceId })];
+      if (route === 'bound') {
+        env.wcIdBySurface.set(surfaceId, 86);
+        await resolveBrowserTarget(caller);
+        env.wcIdBySurface.clear();
+      }
+      const params = route.startsWith('untargeted') ? {} : route === 'named' ? { surfaceId } : { caller };
+      const pending = request(creates ? 'browser.navigate' : 'browser.snapshot', { ...params, url: 'https://fixture.test/' });
+      await vi.advanceTimersByTimeAsync(5100);
+      const answer = await pending;
+      expect(answer.code).toBe(-32000);
+      expect(answer.message).toMatch(/readiness|not ready/i);
+      expect(answer.message).not.toContain('No browser pane');
+      expect(splitCalls()).toHaveLength(creates ? 1 : 0);
+      expectNoDispatch();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(['caller', 'untargeted'])('only a navigation-first batch may create through the %s path', async (route) => {
+    const caller = nextCaller();
+    const surfaceId = `surf-batch-${caller}`;
+    const browsersIn = { 'ws-batch': [] as string[] };
+    const win = fakeWindow({ workspaceOf: { [caller]: 'ws-batch' }, browsersIn, created: surfaceId });
+    const execute = win.webContents.executeJavaScript;
+    win.webContents.executeJavaScript = async (js) => {
+      if (js.includes('__wmux_splitPane')) {
+        browsersIn['ws-batch'].push(surfaceId);
+        env.wcIdBySurface.set(surfaceId, 74);
+      }
+      return execute(js);
+    };
+    env.windows = [win];
+    const params = route === 'caller' ? { caller } : {};
+    const navigate = { method: 'browser.navigate', params: { url: 'https://fixture.test/' } };
+    const snapshot = { method: 'browser.snapshot', params: {} };
+    expect((await request('browser.batch', { ...params, commands: [snapshot, navigate] })).code).toBe(-32000);
+    expect(splitCalls()).toEqual([]);
+    expectNoDispatch();
+    const invalid = await request('browser.batch', { ...params, commands: [{ method: 'browser.navigate', params: { url: ' ' } }, snapshot] });
+    expect(invalid).toEqual({ result: { results: [{ error: { code: -32602, message: 'browser.navigate requires a nonempty url' } }] } });
+    expect(splitCalls()).toEqual([]);
+    expectNoDispatch();
+    const valid = await request('browser.batch', { ...params, commands: [navigate, snapshot] });
+    expect(valid).toEqual({ result: { results: [{ result: { ok: true } }, { result: SNAPSHOT }] } });
+    expect(splitCalls()).toHaveLength(1);
+  });
+
+  it.each(['browser.snapshot', 'browser.navigate', 'browser.batch'])('refuses a closed explicit terminal with a surviving cached browser for %s', async (method) => {
+    const caller = nextCaller();
+    const surfaceId = `surf-survivor-${caller}`;
+    const workspaceOf = { [caller]: 'ws-old' };
+    env.windows = [fakeWindow({ workspaceOf, browsersIn: { 'ws-old': [surfaceId] }, created: 'surf-forbidden' })];
+    env.wcIdBySurface.set(surfaceId, 75);
+    await resolveBrowserTarget(caller);
+    delete workspaceOf[caller];
+    const answer = await request(method, { caller: 'surf-other-ambient', surfaceId: caller, url: 'https://fixture.test/',
+      commands: [{ method: 'browser.navigate', params: { url: 'https://fixture.test/' } }] });
+    expect(answer.code).toBe(-32000);
+    expect(answer.message).toContain('Unknown or closed surface');
+    expect(splitCalls()).toEqual([]);
+    expectNoDispatch();
+  });
+
+  it.each(['terminal', 'browser'])('honors a live explicit %s in another window instead of the shared browser', async (type) => {
+    const caller = nextCaller();
+    const surfaceId = `surf-second-window-${caller}`;
+    env.windows = [
+      fakeWindow({ browsersIn: { 'ws-unrelated': ['surf-unrelated'] } }),
+      fakeWindow({ workspaceOf: { [caller]: 'ws-second' }, browsersIn: { 'ws-second': [surfaceId] } }),
+    ];
+    env.wcIdBySurface.set('surf-unrelated', 76);
+    env.wcIdBySurface.set(surfaceId, 77);
+    expect(await request('browser.snapshot', { caller: 'surf-ambient', surfaceId: type === 'terminal' ? caller : surfaceId })).toEqual({ result: SNAPSHOT });
+    expect(cdpBridge.snapshot).toHaveBeenCalledWith(77);
+    expect(splitCalls()).toEqual([]);
+  });
+
+  it('does not fall back to a shared browser when an explicit scoped split fails', async () => {
+    const caller = nextCaller();
+    env.windows = [fakeWindow({ browsersIn: { 'ws-shared': ['surf-shared-failure'] } }), fakeWindow({ workspaceOf: { [caller]: 'ws-empty' } })];
+    env.wcIdBySurface.set('surf-shared-failure', 78);
+    expect((await request('browser.navigate', { surfaceId: caller, url: 'https://fixture.test/' })).code).toBe(-32000);
+    expect(splitCalls()).toHaveLength(1);
+    expectNoDispatch();
+  });
+
+  it('returns an empty batch without resolving a browser or requiring a window', async () => {
+    expect(await request('browser.batch', { commands: [] })).toEqual({ result: { results: [] } });
+    const win = fakeWindow({ created: 'surf-forbidden' });
+    env.windows = [win];
+    expect(await request('browser.batch', { commands: [], surfaceId: 'surf-closed' })).toEqual({ result: { results: [] } });
+    expect(win.calls).toEqual([]);
+    expectNoDispatch();
+  });
+
+  it('keeps unknown-method codes without creating a pane, including nested batch errors', async () => {
+    env.windows = [fakeWindow({ created: 'surf-forbidden' })];
+    expect((await request('browser.unknown')).code).toBe(-32601);
+    const batch = await request('browser.batch', { commands: [{ method: 'browser.unknown' }, { method: 'browser.snapshot' }] });
+    expect(batch).toEqual({ result: { results: [{ error: { code: -32601, message: 'Unknown: browser.unknown' } }] } });
+    expect(splitCalls()).toEqual([]);
+    expectNoDispatch();
+  });
+});
+
 describe('the dashboard reference an agent command takes', () => {
   beforeEach(resetEnv);
 
@@ -772,7 +1233,10 @@ describe('the dashboard reference an agent command takes', () => {
 describe('complete agent command readiness budget', () => {
   beforeEach(resetEnv);
 
-  it.each(['browser.snapshot', 'browser.navigate'])('times out %s readiness including prior resolution, with no later requested verb dispatch', async (method) => {
+  it.each([
+    ['browser.snapshot', 'caller'], ['browser.navigate', 'caller'],
+    ['browser.snapshot', 'untargeted'], ['browser.navigate', 'untargeted'],
+  ])('times out %s readiness including prior %s resolution, with no later requested verb dispatch', async (method, route) => {
     vi.useFakeTimers();
     try {
       const caller = nextCaller();
@@ -780,14 +1244,16 @@ describe('complete agent command readiness budget', () => {
       const win = fakeWindow({ workspaceOf: { [caller]: 'ws-budget' }, browsersIn: { 'ws-budget': [surfaceId] }, engines: { [surfaceId]: 'agent' } });
       const execute = win.webContents.executeJavaScript;
       win.webContents.executeJavaScript = async (js) => {
-        if (js.includes('__wmux_getWorkspaceIdForSurface')) await new Promise((resolve) => setTimeout(resolve, 3000));
+        if (js.includes(route === 'caller' ? '__wmux_locateSurface' : '__wmux_listWorkspaces')) {
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+        }
         return execute(js);
       };
       env.windows = [win];
       const startup = vi.fn(async () => { await new Promise((resolve) => setTimeout(resolve, 3000)); return SESSION; });
       env.startImpl = startup;
       const respond = vi.fn(), error = vi.fn();
-      handleBrowserV2(method, { caller, url: 'https://fixture.test/' }, respond, error);
+      handleBrowserV2(method, { ...(route === 'caller' ? { caller } : {}), url: 'https://fixture.test/' }, respond, error);
       await vi.advanceTimersByTimeAsync(4999);
       expect(startup).toHaveBeenCalledOnce();
       expect(error).not.toHaveBeenCalled();
@@ -862,10 +1328,9 @@ describe('handleBrowserV2 error codes', () => {
   });
 
   it('still reports a browser that could not be opened as -32000', async () => {
-    // No window at all: resolution returns null and nothing was ever attempted.
     const answer = await respondTo('browser.snapshot', { caller: nextCaller() });
     expect(answer.code).toBe(-32000);
-    expect(answer.message).toBe('Could not open browser panel');
+    expect(answer.message).toContain('No live wmux window');
   });
 });
 

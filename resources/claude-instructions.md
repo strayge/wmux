@@ -57,7 +57,9 @@ wmux browser reload              # reload page
 wmux browser <verb> --surface <id>   # drive a specific pane's browser
 ```
 
-Workflow: `browser open <url>` → `browser snapshot` → read tree → `browser click/type eN` → `browser snapshot` again.
+Page inspection commands never create a pane; start with `wmux browser open <url>`.
+Workflow: `browser snapshot` → read tree → `browser click/type eN` → `browser snapshot` again.
+Find browser panes with `wmux list-surfaces` (`type: browser`); use `--surface <id>` to target one (not a side panel).
 
 Refs (`e1`, `e2`...) expire after page changes — always re-snapshot.
 

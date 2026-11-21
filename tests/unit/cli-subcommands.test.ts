@@ -89,13 +89,27 @@ describe('subcommand dispatch reads args[1], not args[0]', () => {
   });
 });
 
-/**
- * `wmux browser engine [web|agent] [--surface <id>]` — get or flip which
- * engine a browser surface runs on (Task 12). Unlike every other `browser`
- * subcommand, this one is two distinct V2 methods depending on whether a
- * value was given, and it validates that value client-side rather than
- * leaving a typo to round-trip to the server and back.
- */
+describe('browser explicit targeting', () => {
+  it('distinguishes an explicit page target from ambient context', () => {
+    expect(browserRequest(['browser', 'snapshot'], 'surf-ambient')?.params).toEqual({ caller: 'surf-ambient' });
+    expect(browserRequest(['browser', 'snapshot', '--surface', 'surf-explicit'], 'surf-ambient')?.params)
+      .toEqual({ caller: 'surf-explicit', surfaceId: 'surf-explicit' });
+    expect(browserRequest(['browser', 'snapshot'])?.params).toEqual({});
+  });
+
+  it.each([undefined, '', ' ', '--full'])('refuses a missing surface value %s instead of using ambient context', (value) => {
+    const args = ['browser', 'snapshot', '--surface', ...(value === undefined ? [] : [value])];
+    expect(() => browserRequest(args, 'surf-ambient')).toThrow('--surface requires a value');
+  });
+
+  it('strips only the target flag while preserving legacy free-form content', () => {
+    expect(browserRequest(['browser', 'type', 'e1', '--surface', 'surf-target', 'hello', '--panel', 'world'])?.params)
+      .toEqual({ ref: 'e1', text: 'hello --panel world', caller: 'surf-target', surfaceId: 'surf-target' });
+    expect(browserRequest(['browser', 'eval', 'document.title', '--panel'])?.params.js).toBe('document.title --panel');
+  });
+});
+
+/** Getter and setter must remain distinct, including explicit terminal targets. */
 describe('browser engine', () => {
   it('a bare "engine" asks the server what engine this surface is on', () => {
     const req = browserRequest(['browser', 'engine']);
@@ -115,11 +129,9 @@ describe('browser engine', () => {
     expect(req?.params.engine).toBe('web');
   });
 
-  it('carries --surface through as the caller, same as every other browser verb', () => {
-    // cmdBrowser extracts --surface (or $WMUX_SURFACE_ID) and passes it into
-    // browserRequest as `caller` — the same mechanism every other browser
-    // subcommand already uses, so no extra CLI code was needed for this.
-    const req = browserRequest(['browser', 'engine', 'web'], 'surf-1');
+  it('keeps the engine route and caller-only parameter shape for an explicit surface', () => {
+    const req = browserRequest(['browser', 'engine', 'web', '--surface', 'surf-1'], 'surf-ambient');
+    expect(req?.params).not.toHaveProperty('surfaceId');
     expect(req?.method).toBe('browser.set_engine');
     expect(req?.params.engine).toBe('web');
     expect(req?.params.caller).toBe('surf-1');

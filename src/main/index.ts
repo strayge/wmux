@@ -106,8 +106,8 @@ import path from 'path';
 
 // ─── browser.get_engine / browser.set_engine ────────────────────────────────
 //
-// These are handled here rather than in v2-browser.ts's `handleBrowserV2`
-// (out of scope for this change) even though their names start with
+// Engine configuration is separate from v2-browser.ts's page commands,
+// even though these method names start with
 // `browser.` — `routeSpecialV2` below checks for them BEFORE the generic
 // `browser.*` delegation, or they would fall into `runBrowserCommandForTarget`'s
 // verb switch and be rejected as `Unknown: browser.get_engine`.
@@ -127,9 +127,9 @@ type CallerBrowserResolution =
  * effectively bound to, for `browser.get_engine` / `browser.set_engine`.
  *
  * `wmux browser <verb>` already resolves a caller to ITS OWN browser surface
- * (issue #62) — but that binding (`callerBrowserSurface` in v2-browser.ts) is
- * a private module-level map in a file this change does not touch. So this
- * does NOT read or write that map; it re-derives an answer from the same
+ * — but that binding (`callerBrowserSurface` in v2-browser.ts) is private.
+ * Engine configuration does not read or write it; it re-derives an answer
+ * from the same
  * renderer bridge globals v2-browser.ts's `resolveBrowserWcId` uses
  * (`__wmux_getWorkspaceIdForSurface`, `__wmux_listBrowserSurfaces`,
  * `__wmux_splitPane`) — the ones that actually own the split-tree state.
@@ -222,9 +222,8 @@ async function handleGetEngine(
     if (resolution.kind === 'found') {
       surfaceId = resolution.surfaceId;
     } else if (resolution.kind === 'none') {
-      // Nothing bound yet: the next REAL browser verb from this caller would
-      // create a 'web' pane by default, so that is the honest answer — no
-      // need to create anything just to answer a query.
+      // No browser exists: navigation would create a 'web' pane by default.
+      // A getter only reports that default; it must not create a pane.
       respond({ engine: 'web' });
       return;
     } else {
@@ -287,10 +286,9 @@ async function handleSetEngine(
  *
  * Params carry either an explicit `surfaceId` (a known browser surface —
  * always used as-is) or a `caller` (a terminal surface, the shape every other
- * `browser.*` verb already accepts, forwarded here by `cmdBrowser`'s existing
- * `--surface`/`$WMUX_SURFACE_ID` handling with no CLI-side special-casing).
- * Neither present is the one case Part 2 asks for directly: -32602, since
- * there is nothing to resolve.
+ * page command accepts). The CLI passes `--surface` as `caller` for engine
+ * commands too, so it may name a browser directly or resolve a terminal's
+ * workspace. With neither parameter, answer -32602 rather than guessing.
  */
 function handleBrowserEngineV2(
   method: string,
